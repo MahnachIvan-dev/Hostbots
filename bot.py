@@ -1,21 +1,11 @@
 """
-🤖 BotHost — простой Telegram-бот для хостинга ботов
+🤖 BotHost — хостинг Telegram-ботов
 
-ФУНКЦИОНАЛ:
-✅ Оплата через Telegram Stars
-✅ Загрузка .py файлов ботов
-✅ Запуск ботов в subprocess
-✅ Проверка подарков владельцу
-✅ Админ-панель
-
-АРХИТЕКТУРА:
-- Один файл bot.py
-- SQLite для хранения данных
-- Subprocess для запуска ботов
-- Telethon для проверки подарков
-
-ДЕПЛОЙ:
-- Только Railway (или любой VPS)
+✅ Оплата ТОЛЬКО подарками
+✅ Система админов
+✅ Приветствие с картинкой
+✅ Рассылка и блокировки
+✅ Мониторинг ботов
 """
 
 import os
@@ -23,25 +13,28 @@ import sys
 import asyncio
 import subprocess
 import sqlite3
-import json
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Dict, List, Optional
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    LabeledPrice, BufferedInputFile
+    FSInputFile, BufferedInputFile
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# === КОНФИГУРАЦИЯ ===
+# ═══════════════════════════════════════════════════════════════
+# 🔧 КОНФИГУРАЦИЯ
+# ═══════════════════════════════════════════════════════════════
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_TELEGRAM_ID"])
+OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "")  # Без @
 OWNER_PHONE = os.environ.get("OWNER_PHONE")
 OWNER_API_ID = os.environ.get("OWNER_API_ID")
 OWNER_API_HASH = os.environ.get("OWNER_API_HASH")
@@ -50,52 +43,53 @@ OWNER_API_HASH = os.environ.get("OWNER_API_HASH")
 DATA_DIR = Path("./data")
 BOTS_DIR = DATA_DIR / "bots"
 DB_PATH = DATA_DIR / "bot.db"
+WELCOME_IMAGE = DATA_DIR / "welcome.jpg"
 DATA_DIR.mkdir(exist_ok=True)
 BOTS_DIR.mkdir(exist_ok=True)
 
-# Тарифы
+# Тарифы (только подарки)
 PLANS = {
-    "week": {"name": "Неделя", "stars": 1, "days": 7},
-    "2weeks": {"name": "2 недели", "stars": 25, "days": 14},
-    "month": {"name": "Месяц", "stars": 50, "days": 30},
+    "week": {"name": "Неделя", "min_stars": 1, "days": 7, "emoji": "📅"},
+    "2weeks": {"name": "2 недели", "min_stars": 25, "days": 14, "emoji": "📅"},
+    "month": {"name": "Месяц", "min_stars": 50, "days": 30, "emoji": "🗓"},
 }
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger("BotHost")
 
-# === ИНИЦИАЛИЗАЦИЯ ===
+# ═══════════════════════════════════════════════════════════════
+# 🚀 ИНИЦИАЛИЗАЦИЯ
+# ═══════════════════════════════════════════════════════════════
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-
-# Реестр запущенных ботов
 running_bots: Dict[int, subprocess.Popen] = {}
 
 
-# === БАЗА ДАННЫХ (SQLite) ===
+# ═══════════════════════════════════════════════════════════════
+# 💾 БАЗА ДАННЫХ (SQLite)
+# ═══════════════════════════════════════════════════════════════
 
 def init_db():
-    """Инициализация базы данных"""
+    """Инициализация БД"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # Таблица пользователей
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
+            full_name TEXT,
             is_admin INTEGER DEFAULT 0,
             is_banned INTEGER DEFAULT 0,
             created_at TEXT
         )
     """)
     
-    # Проверка наличия поля is_banned (для совместимости со старыми БД)
-    try:
-        c.execute("SELECT is_banned FROM users LIMIT 1")
-    except sqlite3.OperationalError:
-        c.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
-    
-    # Таблица слотов (ячейки для ботов)
     c.execute("""
         CREATE TABLE IF NOT EXISTS slots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,11 +97,10 @@ def init_db():
             plan TEXT,
             expires_at TEXT,
             created_at TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
+            gift_id TEXT
         )
     """)
     
-    # Таблица ботов
     c.execute("""
         CREATE TABLE IF NOT EXISTS bots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,85 +108,186 @@ def init_db():
             filename TEXT,
             bot_token TEXT,
             status TEXT DEFAULT 'stopped',
-            created_at TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
+            created_at TEXT
         )
     """)
     
-    # Таблица платежей
     c.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
+        CREATE TABLE IF NOT EXISTS gifts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
+            username TEXT,
+            gift_value INTEGER,
+            gift_id TEXT UNIQUE,
             plan TEXT,
-            stars INTEGER,
-            created_at TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
+            created_at TEXT
         )
     """)
+    
+    # Миграция: добавляем поля если их нет
+    try:
+        c.execute("SELECT is_banned FROM users LIMIT 1")
+    except sqlite3.OperationalError:
+        c.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+    
+    try:
+        c.execute("SELECT full_name FROM users LIMIT 1")
+    except sqlite3.OperationalError:
+        c.execute("ALTER TABLE users ADD COLUMN full_name TEXT")
+    
+    try:
+        c.execute("SELECT gift_id FROM gifts LIMIT 1")
+    except sqlite3.OperationalError:
+        try:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS gifts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    username TEXT,
+                    gift_value INTEGER,
+                    gift_id TEXT UNIQUE,
+                    plan TEXT,
+                    created_at TEXT
+                )
+            """)
+        except:
+            pass
     
     conn.commit()
     conn.close()
-    logger.info("База данных инициализирована")
+    logger.info("💾 База данных инициализирована")
 
 
 def get_db():
-    """Получить соединение с БД"""
     return sqlite3.connect(DB_PATH)
 
 
-def get_user(user_id: int):
-    """Получить пользователя"""
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    user = c.fetchone()
-    conn.close()
-    return user
+# ─── Пользователи ──────────────────────────────────────────
 
-
-def create_user(user_id: int, username: str):
-    """Создать пользователя"""
+def create_user(user_id: int, username: str, full_name: str = ""):
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, created_at) VALUES (?, ?, ?)",
-        (user_id, username, datetime.now().isoformat())
+        "INSERT OR IGNORE INTO users (user_id, username, full_name, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, username, full_name, datetime.now().isoformat())
     )
     conn.commit()
     conn.close()
 
 
+def get_user(user_id: int):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def get_all_users():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users ORDER BY created_at DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def is_user_banned(user_id: int) -> bool:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return bool(row and row[0])
+
+
+def ban_user(user_id: int):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def unban_user(user_id: int):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+# ─── Админы ────────────────────────────────────────────────
+
+def is_admin(user_id: int) -> bool:
+    """Проверить: владелец или админ"""
+    if user_id == OWNER_ID:
+        return True
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return bool(row and row[0])
+
+
+def add_admin(user_id: int):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def remove_admin(user_id: int):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_all_admins() -> List[int]:
+    """Получить всех админов (кроме владельца)"""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id, username, full_name FROM users WHERE is_admin = 1")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+# ─── Слоты ─────────────────────────────────────────────────
+
 def get_active_slots(user_id: int):
-    """Получить активные слоты пользователя"""
     conn = get_db()
     c = conn.cursor()
     c.execute(
         "SELECT * FROM slots WHERE user_id = ? AND expires_at > ?",
         (user_id, datetime.now().isoformat())
     )
-    slots = c.fetchall()
+    rows = c.fetchall()
     conn.close()
-    return slots
+    return rows
 
 
-def create_slot(user_id: int, plan: str):
-    """Создать слот"""
+def create_slot(user_id: int, plan: str, gift_id: str = ""):
     days = PLANS[plan]["days"]
     expires_at = datetime.now() + timedelta(days=days)
-    
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO slots (user_id, plan, expires_at, created_at) VALUES (?, ?, ?, ?)",
-        (user_id, plan, expires_at.isoformat(), datetime.now().isoformat())
+        "INSERT INTO slots (user_id, plan, expires_at, created_at, gift_id) VALUES (?, ?, ?, ?, ?)",
+        (user_id, plan, expires_at.isoformat(), datetime.now().isoformat(), gift_id)
     )
     conn.commit()
     conn.close()
 
 
+# ─── Боты ──────────────────────────────────────────────────
+
 def save_bot(user_id: int, filename: str, bot_token: str):
-    """Сохранить бота"""
     conn = get_db()
     c = conn.cursor()
     c.execute(
@@ -207,188 +301,114 @@ def save_bot(user_id: int, filename: str, bot_token: str):
 
 
 def get_user_bots(user_id: int):
-    """Получить ботов пользователя"""
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT * FROM bots WHERE user_id = ?", (user_id,))
-    bots = c.fetchall()
+    rows = c.fetchall()
     conn.close()
-    return bots
+    return rows
 
 
 def get_bot(bot_id: int):
-    """Получить бота по ID"""
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT * FROM bots WHERE id = ?", (bot_id,))
-    bot = c.fetchone()
-    conn.close()
-    return bot
-
-
-def create_payment(user_id: int, plan: str, stars: int):
-    """Создать платёж"""
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO payments (user_id, plan, stars, created_at) VALUES (?, ?, ?, ?)",
-        (user_id, plan, stars, datetime.now().isoformat())
-    )
-    conn.commit()
-    conn.close()
-
-
-def is_user_banned(user_id: int) -> bool:
-    """Проверить заблокирован ли пользователь"""
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     conn.close()
-    return bool(row and row[0])
+    return row
 
 
-def ban_user(user_id: int):
-    """Заблокировать пользователя"""
+def delete_bot(bot_id: int):
     conn = get_db()
     c = conn.cursor()
-    c.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-    # Остановить все бота пользователя
-    user_bots = get_user_bots(user_id)
-    for b in user_bots:
-        asyncio.create_task(stop_bot(b[0]))
-
-
-def unban_user(user_id: int):
-    """Разблокировать пользователя"""
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (user_id,))
+    c.execute("DELETE FROM bots WHERE id = ?", (bot_id,))
     conn.commit()
     conn.close()
 
 
-def get_all_users():
-    """Получить всех пользователей"""
+# ─── Подарки ───────────────────────────────────────────────
+
+def save_gift(user_id: int, username: str, gift_value: int, gift_id: str, plan: str):
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM users ORDER BY created_at DESC")
-    users = c.fetchall()
+    try:
+        c.execute(
+            "INSERT INTO gifts (user_id, username, gift_value, gift_id, plan, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, username, gift_value, gift_id, plan, datetime.now().isoformat())
+        )
+        conn.commit()
+        success = True
+    except sqlite3.IntegrityError:
+        success = False  # Уже обработан
     conn.close()
-    return users
+    return success
 
+
+# ─── Статистика ────────────────────────────────────────────
 
 def get_stats():
-    """Получить статистику"""
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM users")
     total_users = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1")
-    banned_users = c.fetchone()[0]
+    banned = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+    admins = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM slots WHERE expires_at > ?", (datetime.now().isoformat(),))
     active_slots = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM bots")
     total_bots = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM payments")
-    total_payments = c.fetchone()[0]
-    c.execute("SELECT SUM(stars) FROM payments")
-    total_stars = c.fetchone()[0] or 0
+    c.execute("SELECT COUNT(*), COALESCE(SUM(gift_value), 0) FROM gifts")
+    gifts_row = c.fetchone()
+    total_gifts = gifts_row[0]
+    total_stars = gifts_row[1]
     conn.close()
     return {
         "total_users": total_users,
-        "banned_users": banned_users,
+        "banned": banned,
+        "admins": admins,
         "active_slots": active_slots,
         "total_bots": total_bots,
-        "total_payments": total_payments,
-        "total_stars": total_stars,
         "running_bots": len(running_bots),
+        "total_gifts": total_gifts,
+        "total_stars": total_stars,
     }
 
 
-async def broadcast_message(text: str, parse_mode: str = "HTML"):
-    """Рассылка сообщений всем пользователям"""
-    users = get_all_users()
-    success = 0
-    failed = 0
-    for user in users:
-        try:
-            await bot.send_message(user[0], text, parse_mode=parse_mode)
-            success += 1
-            await asyncio.sleep(0.05)  # Защита от flood
-        except Exception:
-            failed += 1
-    return success, failed
+# ═══════════════════════════════════════════════════════════════
+# 🚀 СИСТЕМА ХОСТА (запуск ботов пользователей)
+# ═══════════════════════════════════════════════════════════════
 
-
-# === СИСТЕМА ХОСТА БОТОВ ===
-# Это код, который реально запускает ботов пользователей
-
-async def start_bot(bot_id: int, code: str, bot_token: str) -> bool:
-    """
-    🚀 ЗАПУСК БОТА ПОЛЬЗОВАТЕЛЯ
-    
-    Этот код:
-    1. Создаёт отдельную папку для бота
-    2. Сохраняет код пользователя
-    3. Устанавливает зависимости (aiogram, telebot и т.д.)
-    4. Запускает бота в изолированном процессе
-    5. Подставляет BOT_TOKEN из окружения
-    """
+async def start_user_bot(bot_id: int, code: str, bot_token: str) -> bool:
+    """Запустить бота пользователя в отдельном процессе"""
     try:
-        # Изолированная директория для бота
         bot_dir = BOTS_DIR / f"bot_{bot_id}"
         bot_dir.mkdir(exist_ok=True)
         
-        # Сохраняем код пользователя
-        bot_file = bot_dir / "user_bot.py"
-        bot_file.write_text(code, encoding="utf-8")
+        # Сохраняем код
+        (bot_dir / "user_bot.py").write_text(code, encoding="utf-8")
         
-        # Создаём requirements.txt для популярных библиотек
-        req_file = bot_dir / "requirements.txt"
-        req_file.write_text(
-            "aiogram>=3.0\n"
-            "pyTelegramBotAPI\n"
-            "python-telegram-bot\n"
-            "aiohttp\n",
-            encoding="utf-8"
-        )
-        
-        # Создаём wrapper-скрипт, который подставляет токен
-        wrapper_code = f'''"""
-Wrapper для запуска бота пользователя.
-Подставляет BOT_TOKEN из окружения.
-"""
-import os
-import sys
+        # Wrapper с подстановкой токена
+        wrapper = f'''"""Wrapper хоста — подставляет BOT_TOKEN из env"""
+import os, sys, importlib.util
 
-# Токен берётся из окружения (подставляется хостом)
 if not os.environ.get("BOT_TOKEN"):
-    print("ERROR: BOT_TOKEN не установлен")
-    sys.exit(1)
+    print("[ERROR] BOT_TOKEN не установлен"); sys.exit(1)
 
-# Импортируем и запускаем код пользователя
 try:
-    import importlib.util
     spec = importlib.util.spec_from_file_location("user_bot", "user_bot.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 except Exception as e:
-    print(f"ERROR: {{e}}")
-    sys.exit(1)
+    print(f"[ERROR] {{e}}"); sys.exit(1)
 '''
-        wrapper_file = bot_dir / "wrapper.py"
-        wrapper_file.write_text(wrapper_code, encoding="utf-8")
+        (bot_dir / "wrapper.py").write_text(wrapper, encoding="utf-8")
         
-        # Файл логов
         log_file = bot_dir / "bot.log"
-        
-        # Запускаем процесс с ограничениями
         env = os.environ.copy()
         env["BOT_TOKEN"] = bot_token
-        env["PYTHONUNBUFFERED"] = "1"  # Чтобы логи писались сразу
+        env["PYTHONUNBUFFERED"] = "1"
         
         with open(log_file, "w", encoding="utf-8") as lf:
             process = subprocess.Popen(
@@ -401,105 +421,85 @@ except Exception as e:
             )
         
         running_bots[bot_id] = process
-        logger.info(f"✅ Бот {bot_id} запущен (PID: {process.pid})")
+        logger.info(f"✅ Бот #{bot_id} запущен (PID {process.pid})")
         
-        # Обновляем статус в БД
         conn = get_db()
         c = conn.cursor()
         c.execute("UPDATE bots SET status = 'running' WHERE id = ?", (bot_id,))
         conn.commit()
         conn.close()
-        
         return True
     except Exception as e:
-        logger.error(f"❌ Ошибка запуска бота {bot_id}: {e}")
+        logger.error(f"❌ Ошибка запуска #{bot_id}: {e}")
         return False
 
 
-async def stop_bot(bot_id: int):
-    """⏹ Остановить бота"""
+async def stop_user_bot(bot_id: int):
+    """Остановить бота"""
     if bot_id in running_bots:
-        process = running_bots[bot_id]
+        proc = running_bots[bot_id]
         try:
-            process.terminate()
+            proc.terminate()
             try:
-                process.wait(timeout=5)
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                process.kill()
+                proc.kill()
         except Exception as e:
-            logger.error(f"Ошибка остановки {bot_id}: {e}")
+            logger.error(f"Ошибка остановки #{bot_id}: {e}")
         del running_bots[bot_id]
-        logger.info(f"⏹ Бот {bot_id} остановлен")
     
-    # Обновляем статус в БД
     conn = get_db()
     c = conn.cursor()
     c.execute("UPDATE bots SET status = 'stopped' WHERE id = ?", (bot_id,))
     conn.commit()
     conn.close()
+    logger.info(f"⏹ Бот #{bot_id} остановлен")
 
 
 def get_bot_logs(bot_id: int, lines: int = 50) -> str:
-    """📄 Получить логи бота"""
     log_file = BOTS_DIR / f"bot_{bot_id}" / "bot.log"
     if not log_file.exists():
-        return "Логи пока пустые"
+        return "📭 Логи пока пустые"
     try:
         content = log_file.read_text(encoding="utf-8", errors="ignore")
-        log_lines = content.strip().split("\n")
-        return "\n".join(log_lines[-lines:]) or "Логи пока пустые"
+        return "\n".join(content.strip().split("\n")[-lines:]) or "📭 Логи пока пустые"
     except Exception as e:
-        return f"Ошибка чтения логов: {e}"
+        return f"❌ Ошибка: {e}"
 
 
 async def monitor_bots():
-    """
-    🔄 Мониторинг запущенных ботов
-    
-    Периодически проверяет статус процессов:
-    - Если бот упал — пытается перезапустить
-    - Если у пользователя истёк слот — останавливает бота
-    - Если пользователь заблокирован — останавливает бота
-    """
-    logger.info("🔄 Мониторинг ботов запущен")
+    """Мониторинг ботов каждые 30 сек"""
+    logger.info("🔄 Мониторинг запущен")
     while True:
         try:
-            for bot_id, process in list(running_bots.items()):
-                # Проверяем, жив ли процесс
-                if process.poll() is not None:
-                    # Процесс завершился
-                    exit_code = process.returncode
-                    logger.warning(f"⚠️ Бот {bot_id} упал (exit: {exit_code})")
+            for bot_id, proc in list(running_bots.items()):
+                if proc.poll() is not None:
+                    # Упал
+                    code = proc.returncode
                     del running_bots[bot_id]
                     
-                    # Обновляем статус в БД
                     conn = get_db()
                     c = conn.cursor()
-                    c.execute(
-                        "UPDATE bots SET status = 'error' WHERE id = ?",
-                        (bot_id,)
-                    )
+                    c.execute("UPDATE bots SET status = 'error' WHERE id = ?", (bot_id,))
+                    c.execute("SELECT user_id FROM bots WHERE id = ?", (bot_id,))
+                    row = c.fetchone()
                     conn.commit()
-                    c.execute("SELECT user_id FROM bots WHERE id = ?", (bot_id,))
-                    row = c.fetchone()
                     conn.close()
                     
                     if row:
-                        user_id = row[0]
-                        # Уведомляем пользователя
+                        logs = get_bot_logs(bot_id, 10)
                         try:
-                            logs = get_bot_logs(bot_id, 10)
                             await bot.send_message(
-                                user_id,
-                                f"⚠️ **Ваш бот #{bot_id} упал**\n\n"
-                                f"Код ошибки: {exit_code}\n"
-                                f"Последние логи:\n```\n{logs[:500]}\n```",
-                                parse_mode="Markdown"
+                                row[0],
+                                f"⚠️ <b>Бот #{bot_id} упал</b>\n\n"
+                                f"Код: {code}\n"
+                                f"<pre>{logs[:500]}</pre>\n\n"
+                                f"Перезапусти через /start",
+                                parse_mode="HTML"
                             )
-                        except Exception:
-                            pass
+                        except: pass
                 else:
-                    # Процесс жив — проверяем подписку пользователя
+                    # Проверка подписки/блокировки
                     conn = get_db()
                     c = conn.cursor()
                     c.execute("SELECT user_id FROM bots WHERE id = ?", (bot_id,))
@@ -507,38 +507,23 @@ async def monitor_bots():
                     conn.close()
                     
                     if row:
-                        user_id = row[0]
-                        # Проверка блокировки
-                        if is_user_banned(user_id):
-                            logger.info(f"🚫 Останавливаю бота {bot_id} — пользователь заблокирован")
-                            await stop_bot(bot_id)
-                            continue
-                        
-                        # Проверка подписки
-                        slots = get_active_slots(user_id)
-                        if not slots:
-                            logger.info(f"⏰ Останавливаю бота {bot_id} — истёк слот")
-                            await stop_bot(bot_id)
-                            try:
-                                await bot.send_message(
-                                    user_id,
-                                    f"⏰ **Ваш бот #{bot_id} остановлен**\n\n"
-                                    f"Слот истёк. Купите новый слот через /start"
-                                )
-                            except Exception:
-                                pass
+                        uid = row[0]
+                        if is_user_banned(uid) or not get_active_slots(uid):
+                            await stop_user_bot(bot_id)
         except Exception as e:
-            logger.error(f"Ошибка мониторинга: {e}")
+            logger.error(f"Мониторинг: {e}")
         
-        await asyncio.sleep(30)  # Проверка каждые 30 секунд
+        await asyncio.sleep(30)
 
 
-# === ПРОВЕРКА ПОДАРКОВ (TELETHON) ===
+# ═══════════════════════════════════════════════════════════════
+# 🎁 ПРОВЕРКА ПОДАРКОВ (через Telethon)
+# ═══════════════════════════════════════════════════════════════
 
 async def check_gifts():
-    """Проверять подарки владельцу через Telethon"""
+    """Проверка подарков владельцу через Userbot"""
     if not all([OWNER_PHONE, OWNER_API_ID, OWNER_API_HASH]):
-        logger.warning("Не настроены OWNER_PHONE/API_ID/API_HASH — проверка подарков отключена")
+        logger.warning("⚠️ Не настроены данные для отслеживания подарков")
         return
     
     try:
@@ -546,61 +531,134 @@ async def check_gifts():
         
         client = TelegramClient("owner_session", int(OWNER_API_ID), OWNER_API_HASH)
         await client.start(phone=OWNER_PHONE)
-        logger.info(f"Userbot подключен: {OWNER_PHONE}")
+        logger.info(f"✅ Userbot подключен: {OWNER_PHONE}")
         
         @client.on(events.NewMessage(incoming=True))
-        async def on_gift(event):
-            # Проверяем, является ли сообщение подарком
-            if hasattr(event.message, 'action'):
-                action = event.message.action
-                if hasattr(action, 'gift') or 'gift' in str(type(action)).lower():
-                    sender = await event.get_sender()
-                    if sender:
-                        gift_value = getattr(action, 'stars', 0) or 1
-                        logger.info(f"🎁 Подарок от {sender.id}: {gift_value} stars")
-                        await process_gift(sender.id, sender.username, gift_value)
+        async def on_msg(event):
+            try:
+                if hasattr(event.message, 'action'):
+                    action = event.message.action
+                    if 'gift' in str(type(action)).lower():
+                        sender = await event.get_sender()
+                        if sender and sender.id != OWNER_ID:
+                            value = getattr(action, 'stars', 0) or getattr(action, 'cost', 0) or 1
+                            gift_id = f"{event.id}_{event.chat_id}_{int(datetime.now().timestamp())}"
+                            await process_gift(sender.id, sender.username or sender.first_name, value, gift_id)
+            except Exception as e:
+                logger.error(f"Ошибка обработки подарка: {e}")
         
         await client.run_until_disconnected()
     except ImportError:
-        logger.warning("Telethon не установлен — проверка подарков отключена")
+        logger.warning("Telethon не установлен")
     except Exception as e:
-        logger.error(f"Ошибка проверки подарков: {e}")
+        logger.error(f"Userbot ошибка: {e}")
 
 
-async def process_gift(sender_id: int, username: str, gift_value: int):
-    """Обработать подарок"""
+async def process_gift(user_id: int, username: str, value: int, gift_id: str):
+    """Обработка подарка"""
     # Определяем план
-    if gift_value >= 50:
+    if value >= 50:
         plan = "month"
-    elif gift_value >= 25:
+    elif value >= 25:
         plan = "2weeks"
-    elif gift_value >= 1:
+    elif value >= 1:
         plan = "week"
     else:
         return
     
-    # Создаём слот
-    create_slot(sender_id, plan)
+    # Сохраняем (с проверкой уникальности)
+    if not save_gift(user_id, username, value, gift_id, plan):
+        return  # Уже обработан
+    
+    create_slot(user_id, plan, gift_id)
     
     # Уведомляем пользователя
     try:
         await bot.send_message(
-            sender_id,
-            f"🎁 **Спасибо за подарок!**\n\n"
-            f"✅ Вам активирован слот на **{PLANS[plan]['name']}**.\n"
-            f"Используйте /upload чтобы загрузить бота."
+            user_id,
+            f"🎁 <b>Спасибо за подарок!</b>\n\n"
+            f"✅ Тебе активирован слот: <b>{PLANS[plan]['name']}</b>\n"
+            f"💎 Стоимость: {value}⭐\n\n"
+            f"Теперь можешь загрузить бота — /start",
+            parse_mode="HTML"
         )
-    except Exception:
-        pass
+    except: pass
     
-    # Уведомляем владельца
-    await bot.send_message(
-        OWNER_ID,
-        f"🎁 Подарок от @{username or sender_id}: {gift_value}⭐ → {PLANS[plan]['name']}"
+    # Уведомляем админов
+    admin_msg = (
+        f"🎁 <b>Новый подарок!</b>\n\n"
+        f"👤 От: @{username or '—'} (ID: <code>{user_id}</code>)\n"
+        f"💎 Стоимость: {value}⭐\n"
+        f"📅 План: {PLANS[plan]['name']}\n"
+        f"🆔 Gift ID: <code>{gift_id}</code>"
     )
+    try:
+        await bot.send_message(OWNER_ID, admin_msg, parse_mode="HTML")
+        for admin_row in get_all_admins():
+            try:
+                await bot.send_message(admin_row[0], admin_msg, parse_mode="HTML")
+            except: pass
+    except: pass
+    
+    logger.info(f"🎁 Подарок: {user_id} → {plan} ({value}⭐)")
 
 
-# === TELEGRAM БОТ (ИНТЕРФЕЙС) ===
+# ═══════════════════════════════════════════════════════════════
+# 💬 ТЕКСТЫ И ИНТЕРФЕЙС
+# ═══════════════════════════════════════════════════════════════
+
+def get_profile_link() -> str:
+    """Ссылка на профиль владельца"""
+    if OWNER_USERNAME:
+        return f"https://t.me/{OWNER_USERNAME}"
+    return f"tg://user?id={OWNER_ID}"
+
+
+WELCOME_TEXT = """
+👋 <b>Привет, {name}!</b>
+
+Я — <b>BotHost</b>, твой персональный хостинг для Telegram-ботов.
+
+━━━━━━━━━━━━━━━━━━━━
+
+🎁 <b>Как начать?</b>
+1️⃣ Подари подарок владельцу
+2️⃣ Получи слот автоматически
+3️⃣ Загрузи своего бота
+4️⃣ Работай 24/7 ✨
+
+━━━━━━━━━━━━━━━━━━━━
+
+💎 <b>Тарифы (оплата подарком):</b>
+📅 <b>Неделя</b> — подарок от 1⭐
+📅 <b>2 недели</b> — подарок от 25⭐
+🗓 <b>Месяц</b> — подарок от 50⭐
+
+━━━━━━━━━━━━━━━━━━━━
+
+Выбери действие ниже 👇
+"""
+
+
+def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
+    """Главное меню"""
+    buttons = [
+        [InlineKeyboardButton(text="🎁 Как купить слот", callback_data="how_gift")],
+        [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
+        [InlineKeyboardButton(text="🤖 Мои боты", callback_data="mybots")],
+        [InlineKeyboardButton(text="📊 Мои слоты", callback_data="myslots")],
+        [InlineKeyboardButton(text="❓ Помощь", callback_data="help")],
+    ]
+    
+    if is_admin(user_id):
+        buttons.append([InlineKeyboardButton(text="🔐 Админ-панель", callback_data="admin")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 📱 ХЕНДЛЕРЫ БОТА
+# ═══════════════════════════════════════════════════════════════
 
 class UploadStates(StatesGroup):
     waiting_file = State()
@@ -609,205 +667,581 @@ class UploadStates(StatesGroup):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    # Проверка блокировки
+    """Главная команда"""
     if is_user_banned(message.from_user.id):
         await message.answer(
-            "🚫 **Вы заблокированы**\n\n"
-            "Ваш аккаунт заблокирован администратором.\n"
-            "Если считаете что это ошибка — свяжитесь с поддержкой."
+            "🚫 <b>Вы заблокированы</b>\n\n"
+            "Ваш аккаунт заблокирован администрацией.",
+            parse_mode="HTML"
         )
         return
     
-    create_user(message.from_user.id, message.from_user.username)
+    create_user(
+        message.from_user.id,
+        message.from_user.username or "",
+        message.from_user.full_name or ""
+    )
     
-    kb_buttons = [
-        [InlineKeyboardButton(text="💎 Купить слот", callback_data="pricing")],
-        [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
-        [InlineKeyboardButton(text="🤖 Мои боты", callback_data="mybots")],
-        [InlineKeyboardButton(text="🎁 Оплата подарком", callback_data="gift_info")],
-    ]
+    text = WELCOME_TEXT.format(name=message.from_user.first_name)
+    kb = main_menu_kb(message.from_user.id)
     
-    # Кнопка админки для владельца
-    if message.from_user.id == OWNER_ID:
-        kb_buttons.append([InlineKeyboardButton(text="🔐 Админ-панель", callback_data="admin")])
+    # Если есть картинка приветствия — отправляем с ней
+    if WELCOME_IMAGE.exists() and message.from_user.id != OWNER_ID:
+        try:
+            await message.answer_photo(
+                photo=FSInputFile(WELCOME_IMAGE),
+                caption=text,
+                reply_markup=kb,
+                parse_mode="HTML"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Ошибка отправки фото: {e}")
     
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "back_main")
+async def cb_back_main(call: types.CallbackQuery):
+    if is_user_banned(call.from_user.id):
+        return await call.answer("🚫 Вы заблокированы", show_alert=True)
+    
+    text = WELCOME_TEXT.format(name=call.from_user.first_name)
+    kb = main_menu_kb(call.from_user.id)
+    
+    if WELCOME_IMAGE.exists():
+        try:
+            await call.message.delete()
+            await call.message.answer_photo(
+                photo=FSInputFile(WELCOME_IMAGE),
+                caption=text,
+                reply_markup=kb,
+                parse_mode="HTML"
+            )
+            return
+        except: pass
+    
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+# ─── Как купить (подарок) ─────────────────────────────────
+
+@dp.callback_query(F.data == "how_gift")
+async def cb_how_gift(call: types.CallbackQuery):
+    link = get_profile_link()
+    text = (
+        "🎁 <b>Как купить слот (оплата подарком)</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"1️⃣ Открой <a href=\"{link}\"><b>профиль владельца</b></a>\n\n"
+        "2️⃣ Нажми <b>⋮</b> (три точки) → <b>🎁 Подарить</b>\n\n"
+        "3️⃣ Выбери подарок по стоимости:\n\n"
+        "   💎 <b>1+⭐</b> → Неделя\n"
+        "   💎 <b>25+⭐</b> → 2 недели\n"
+        "   💎 <b>50+⭐</b> → Месяц\n\n"
+        "4️⃣ Отправь подарок\n\n"
+        "5️⃣ Слот активируется <b>мгновенно</b>! ⚡\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💡 <i>Подарки приходят сразу на аккаунт владельца — это быстрее и без комиссий!</i>"
+    )
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Открыть профиль владельца", url=link)],
+        [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
+    ])
+    
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+
+
+# ─── Загрузка бота ────────────────────────────────────────
+
+@dp.callback_query(F.data == "upload")
+async def cb_upload(call: types.CallbackQuery, state: FSMContext):
+    if is_user_banned(call.from_user.id):
+        return await call.answer("🚫 Вы заблокированы", show_alert=True)
+    
+    slots = get_active_slots(call.from_user.id)
+    if not slots:
+        await call.answer("❌ Нет активных слотов! Купи через подарок", show_alert=True)
+        return
+    
+    await call.message.edit_text(
+        "📤 <b>Загрузка бота</b>\n\n"
+        "Отправь мне <b>.py-файл</b> своего Telegram-бота.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⚠️ <b>Важно:</b>\n"
+        "• Токен: <code>os.environ.get('BOT_TOKEN')</code>\n"
+        "• Не хардкодь токен в коде!\n"
+        "• Поддерживаются: aiogram, telebot, pyrogram\n"
+        "• Макс. размер: 200 КБ\n\n"
+        "💡 <i>Пример есть в разделе Помощь</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Отмена", callback_data="back_main")]
+        ]),
+        parse_mode="HTML"
+    )
+    await state.set_state(UploadStates.waiting_file)
+
+
+@dp.message(UploadStates.waiting_file, F.document)
+async def handle_file(message: types.Message, state: FSMContext):
+    doc = message.document
+    if not doc.file_name.endswith(".py"):
+        return await message.answer("❌ Нужен <b>.py-файл</b>", parse_mode="HTML")
+    
+    if doc.file_size and doc.file_size > 200 * 1024:
+        return await message.answer("❌ Файл слишком большой (макс. 200 КБ)")
+    
+    file_info = await bot.get_file(doc.file_id)
+    file_bytes = await bot.download_file(file_info.file_path)
+    code = file_bytes.read().decode("utf-8")
+    
+    # Валидация
+    errors = []
+    tg_libs = ["aiogram", "telebot", "pyrogram", "telegram", "telethon"]
+    if not any(lib in code for lib in tg_libs):
+        errors.append("• Нет импортов Telegram-библиотек")
+    
+    if "os.environ" not in code and "os.getenv" not in code:
+        errors.append("• Токен должен браться из os.environ")
+    
+    if errors:
+        return await message.answer(
+            "❌ <b>Код не прошёл проверку:</b>\n\n" + "\n".join(errors),
+            parse_mode="HTML"
+        )
+    
+    await state.update_data(code=code, filename=doc.file_name)
+    await message.answer(
+        "✅ <b>Файл принят!</b>\n\n"
+        f"📁 {doc.file_name}\n\n"
+        "Теперь отправь <b>токен этого бота</b> (получи у @BotFather).\n"
+        "🔒 Токен хранится безопасно и используется только для запуска.",
+        parse_mode="HTML"
+    )
+    await state.set_state(UploadStates.waiting_token)
+
+
+@dp.message(UploadStates.waiting_token, F.text)
+async def handle_token(message: types.Message, state: FSMContext):
+    token = message.text.strip()
+    if not token or ":" not in token or len(token) < 40:
+        return await message.answer("❌ Неверный формат токена")
+    
+    # Удалить сообщение с токеном (безопасность)
+    try:
+        await message.delete()
+    except: pass
+    
+    data = await state.get_data()
+    bot_id = save_bot(message.from_user.id, data['filename'], token)
+    
+    # Сохранить код
+    bot_dir = BOTS_DIR / f"bot_{bot_id}"
+    bot_dir.mkdir(exist_ok=True)
+    (bot_dir / "user_bot.py").write_text(data['code'], encoding="utf-8")
     
     await message.answer(
-        f"👋 Привет, {message.from_user.full_name}!\n\n"
-        "Я бот для хостинга твоих Telegram-ботов.\n\n"
-        "💎 **Купить слот** — оплата через Stars\n"
-        "🎁 **Оплата подарком** — подари подарок владельцу\n"
-        "📤 **Загрузить бота** — загрузи .py файл\n\n"
-        "Выбери действие:",
-        reply_markup=kb
+        f"✅ <b>Бот сохранён!</b>\n\n"
+        f"🆔 ID: <code>{bot_id}</code>\n"
+        f"📁 Файл: {data['filename']}\n\n"
+        f"Запусти через <b>🤖 Мои боты</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 К моим ботам", callback_data="mybots")]
+        ]),
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+
+# ─── Мои боты ─────────────────────────────────────────────
+
+@dp.callback_query(F.data == "mybots")
+async def cb_mybots(call: types.CallbackQuery):
+    bots = get_user_bots(call.from_user.id)
+    if not bots:
+        await call.message.edit_text(
+            "🤖 <b>У тебя пока нет ботов</b>\n\n"
+            "Загрузи первого через кнопку ниже!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
+                [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
+            ]),
+            parse_mode="HTML"
+        )
+        return
+    
+    buttons = []
+    for b in bots:
+        status = "🟢" if b[0] in running_bots else "🔴"
+        buttons.append([InlineKeyboardButton(
+            text=f"{status} #{b[0]} • {b[2]}",
+            callback_data=f"bot:{b[0]}"
+        )])
+    buttons.append([InlineKeyboardButton(text="« Главное меню", callback_data="back_main")])
+    
+    await call.message.edit_text(
+        f"🤖 <b>Твои боты ({len(bots)})</b>\n\n"
+        f"🟢 работает • 🔴 остановлен",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
     )
 
 
-# === АДМИН-ПАНЕЛЬ ===
+@dp.callback_query(F.data.startswith("bot:"))
+async def cb_bot_detail(call: types.CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    b = get_bot(bot_id)
+    if not b or b[1] != call.from_user.id:
+        return await call.answer("❌ Нет доступа", show_alert=True)
+    
+    status = "🟢 Работает" if bot_id in running_bots else "🔴 Остановлен"
+    
+    await call.message.edit_text(
+        f"🤖 <b>Бот #{bot_id}</b>\n\n"
+        f"📁 Файл: <code>{b[2]}</code>\n"
+        f"📊 Статус: <b>{status}</b>\n"
+        f"📅 Создан: {b[5][:10]}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="▶️ Запустить", callback_data=f"start:{bot_id}"),
+                InlineKeyboardButton(text="⏹ Стоп", callback_data=f"stop:{bot_id}"),
+            ],
+            [InlineKeyboardButton(text="📄 Логи", callback_data=f"logs:{bot_id}")],
+            [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{bot_id}")],
+            [InlineKeyboardButton(text="« К списку", callback_data="mybots")],
+        ]),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("start:"))
+async def cb_start_bot(call: types.CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    b = get_bot(bot_id)
+    if not b or b[1] != call.from_user.id:
+        return await call.answer("❌ Нет доступа", show_alert=True)
+    
+    if not get_active_slots(call.from_user.id):
+        return await call.answer("❌ Нет активного слота", show_alert=True)
+    
+    if bot_id in running_bots:
+        return await call.answer("⚠️ Уже запущен", show_alert=True)
+    
+    await call.answer("⏳ Запускаю...")
+    
+    bot_dir = BOTS_DIR / f"bot_{bot_id}"
+    code_file = bot_dir / "user_bot.py"
+    if not code_file.exists():
+        return await call.answer("❌ Файл не найден", show_alert=True)
+    
+    code = code_file.read_text(encoding="utf-8")
+    success = await start_user_bot(bot_id, code, b[3])
+    
+    if success:
+        await call.message.answer(f"✅ <b>Бот #{bot_id} запущен!</b>", parse_mode="HTML")
+    else:
+        await call.message.answer(f"❌ <b>Ошибка запуска #{bot_id}</b>", parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("stop:"))
+async def cb_stop_bot(call: types.CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    b = get_bot(bot_id)
+    if not b or b[1] != call.from_user.id:
+        return await call.answer("❌ Нет доступа", show_alert=True)
+    
+    await stop_user_bot(bot_id)
+    await call.answer("⏹ Остановлен")
+    await call.message.answer(f"⏹ <b>Бот #{bot_id} остановлен</b>", parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("logs:"))
+async def cb_logs(call: types.CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    b = get_bot(bot_id)
+    if not b or (b[1] != call.from_user.id and not is_admin(call.from_user.id)):
+        return await call.answer("❌ Нет доступа", show_alert=True)
+    
+    logs = get_bot_logs(bot_id, 30)
+    await call.message.answer(
+        f"📄 <b>Логи бота #{bot_id}</b>\n\n<pre>{logs[:2000]}</pre>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bot_id}")]
+        ]),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("del:"))
+async def cb_delete_bot(call: types.CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    b = get_bot(bot_id)
+    if not b or b[1] != call.from_user.id:
+        return await call.answer("❌ Нет доступа", show_alert=True)
+    
+    await stop_user_bot(bot_id)
+    delete_bot(bot_id)
+    await call.answer("🗑 Удалён")
+    await cb_mybots(call)
+
+
+# ─── Мои слоты ────────────────────────────────────────────
+
+@dp.callback_query(F.data == "myslots")
+async def cb_myslots(call: types.CallbackQuery):
+    slots = get_active_slots(call.from_user.id)
+    if not slots:
+        await call.message.edit_text(
+            "💳 <b>У тебя нет активных слотов</b>\n\n"
+            "Купи через подарок — /start",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎁 Как купить", callback_data="how_gift")],
+                [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
+            ]),
+            parse_mode="HTML"
+        )
+        return
+    
+    text = f"💳 <b>Твои активные слоты ({len(slots)})</b>\n\n"
+    for s in slots:
+        exp = datetime.fromisoformat(s[3])
+        days_left = (exp - datetime.now()).days
+        text += f"• <b>{PLANS[s[2]]['name']}</b> — ещё {days_left} дн. (до {exp.strftime('%d.%m')})\n"
+    
+    await call.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")]
+        ]),
+        parse_mode="HTML"
+    )
+
+
+# ─── Помощь ───────────────────────────────────────────────
+
+@dp.callback_query(F.data == "help")
+async def cb_help(call: types.CallbackQuery):
+    text = (
+        "❓ <b>Помощь</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>🎁 Как купить слот?</b>\n"
+        "Подари подарок владельцу — слот активируется автоматически!\n\n"
+        "<b>📤 Как загрузить бота?</b>\n"
+        "1. Купи слот\n"
+        "2. Отправь .py-файл\n"
+        "3. Отправь токен бота\n"
+        "4. Запусти через «Мои боты»\n\n"
+        "<b>💻 Пример кода:</b>\n"
+        "<pre>import os\n"
+        "from aiogram import Bot, Dispatcher\n\n"
+        "BOT_TOKEN = os.environ.get('BOT_TOKEN')\n"
+        "bot = Bot(token=BOT_TOKEN)\n"
+        "dp = Dispatcher()\n\n"
+        "@dp.message()\n"
+        "async def echo(msg):\n"
+        "    await msg.answer(msg.text)\n\n"
+        "if __name__ == '__main__':\n"
+        "    import asyncio\n"
+        "    asyncio.run(dp.start_polling(bot))</pre>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>📞 Поддержка:</b> напиши владельцу"
+    )
+    await call.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Написать владельцу", url=get_profile_link())],
+            [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
+        ]),
+        parse_mode="HTML"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🔐 АДМИН-ПАНЕЛЬ
+# ═══════════════════════════════════════════════════════════════
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
         return
     await show_admin_panel(message)
 
 
 async def show_admin_panel(message: types.Message, edit: bool = False):
-    """Показать админ-панель"""
     stats = get_stats()
+    text = (
+        "🔐 <b>Админ-панель</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Пользователей: <b>{stats['total_users']}</b>\n"
+        f"🚫 Заблокировано: <b>{stats['banned']}</b>\n"
+        f"🛡 Админов: <b>{stats['admins']}</b>\n"
+        f"💳 Активных слотов: <b>{stats['active_slots']}</b>\n"
+        f"🤖 Ботов: <b>{stats['total_bots']}</b> (🟢 {stats['running_bots']})\n"
+        f"🎁 Подарков: <b>{stats['total_gifts']}</b> ({stats['total_stars']}⭐)\n\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
-        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast")],
-        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users")],
-        [InlineKeyboardButton(text="🚫 Блокировка", callback_data="admin:ban")],
-        [InlineKeyboardButton(text="✅ Разблокировка", callback_data="admin:unban")],
-        [InlineKeyboardButton(text="🔄 Перезапустить все боты", callback_data="admin:restart_all")],
+        [InlineKeyboardButton(text="📊 Подробная статистика", callback_data="adm:stats")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:broadcast")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="adm:users")],
+        [
+            InlineKeyboardButton(text="🚫 Заблокировать", callback_data="adm:ban"),
+            InlineKeyboardButton(text="✅ Разблокировать", callback_data="adm:unban"),
+        ],
+        [
+            InlineKeyboardButton(text="🛡 Добавить админа", callback_data="adm:addadmin"),
+            InlineKeyboardButton(text="❌ Удалить админа", callback_data="adm:remadmin"),
+        ],
+        [InlineKeyboardButton(text="🖼 Приветствие (фото)", callback_data="adm:welcome")],
+        [InlineKeyboardButton(text="🔄 Перезапуск всех", callback_data="adm:restart")],
+        [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
     ])
     
-    text = (
-        f"🔐 **Админ-панель**\n\n"
-        f"👥 Пользователей: {stats['total_users']}\n"
-        f"🚫 Заблокировано: {stats['banned_users']}\n"
-        f"💳 Активных слотов: {stats['active_slots']}\n"
-        f"🤖 Ботов: {stats['total_bots']} (работает: {stats['running_bots']})\n"
-        f"💰 Платежей: {stats['total_payments']} ({stats['total_stars']}⭐)"
-    )
-    
     if edit:
-        await message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+        await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     else:
-        await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "admin")
 async def cb_admin(call: types.CallbackQuery):
-    if call.from_user.id != OWNER_ID:
-        return await call.answer("Нет прав", show_alert=True)
+    if not is_admin(call.from_user.id):
+        return await call.answer("🔐 Нет прав", show_alert=True)
     await show_admin_panel(call.message, edit=True)
 
 
-@dp.callback_query(F.data == "admin:stats")
-async def cb_admin_stats(call: types.CallbackQuery):
-    if call.from_user.id != OWNER_ID:
+@dp.callback_query(F.data == "adm:stats")
+async def cb_adm_stats(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
         return
-    stats = get_stats()
+    s = get_stats()
     text = (
-        f"📊 **Подробная статистика**\n\n"
-        f"👥 **Пользователи:**\n"
-        f"   • Всего: {stats['total_users']}\n"
-        f"   • Заблокировано: {stats['banned_users']}\n"
-        f"   • Активно: {stats['total_users'] - stats['banned_users']}\n\n"
-        f"💳 **Слоты:**\n"
-        f"   • Активных: {stats['active_slots']}\n\n"
-        f"🤖 **Боты:**\n"
-        f"   • Всего загружено: {stats['total_bots']}\n"
-        f"   • Работает сейчас: {stats['running_bots']}\n"
-        f"   • Остановлено: {stats['total_bots'] - stats['running_bots']}\n\n"
-        f"💰 **Финансы:**\n"
-        f"   • Платежей: {stats['total_payments']}\n"
-        f"   • Всего звёзд: {stats['total_stars']}⭐"
+        "📊 <b>Подробная статистика</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>👥 Пользователи:</b>\n"
+        f"   • Всего: {s['total_users']}\n"
+        f"   • Активно: {s['total_users'] - s['banned']}\n"
+        f"   • Заблокировано: {s['banned']}\n"
+        f"   • Админов: {s['admins']}\n\n"
+        "<b>💳 Слоты:</b>\n"
+        f"   • Активных: {s['active_slots']}\n\n"
+        "<b>🤖 Боты:</b>\n"
+        f"   • Загружено: {s['total_bots']}\n"
+        f"   • Работает: {s['running_bots']}\n"
+        f"   • Остановлено: {s['total_bots'] - s['running_bots']}\n\n"
+        "<b>🎁 Подарки:</b>\n"
+        f"   • Получено: {s['total_gifts']}\n"
+        f"   • Всего звёзд: {s['total_stars']}⭐"
     )
     await call.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Назад", callback_data="admin")]
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
         ]),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 
-@dp.callback_query(F.data == "admin:broadcast")
-async def cb_admin_broadcast(call: types.CallbackQuery, state: FSMContext):
-    if call.from_user.id != OWNER_ID:
+@dp.callback_query(F.data == "adm:broadcast")
+async def cb_adm_broadcast(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
         return
     await call.message.edit_text(
-        "📢 **Рассылка**\n\n"
-        "Отправь сообщение, которое нужно разослать всем пользователям.\n\n"
-        "Поддерживается HTML разметка:\n"
-        "<b>жирный</b>, <i>курсив</i>, <a href='...'>ссылка</a>\n\n"
-        "Для отмены: /cancel",
-        parse_mode="Markdown"
+        "📢 <b>Рассылка</b>\n\n"
+        "Отправь сообщение для рассылки.\n\n"
+        "HTML: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;a&gt;</code>\n\n"
+        "Отмена: /cancel",
+        parse_mode="HTML"
     )
-    await state.set_state("broadcast_text")
+    await state.set_state("broadcast")
 
 
-@dp.message(F.state("broadcast_text"))
+@dp.message(F.state("broadcast"))
 async def handle_broadcast(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
         return
+    if message.text == "/cancel":
+        await state.clear()
+        return await message.answer("❌ Отменено")
     
     text = message.text or message.caption or ""
-    if not text or text == "/cancel":
-        await message.answer("❌ Рассылка отменена")
-        await state.clear()
+    if not text:
         return
     
-    await message.answer("⏳ Рассылаю сообщение...")
-    success, failed = await broadcast_message(text)
+    await message.answer("⏳ Рассылаю...")
+    users = get_all_users()
+    ok, fail = 0, 0
+    for u in users:
+        if u[4]:  # banned
+            continue
+        try:
+            await bot.send_message(u[0], text, parse_mode="HTML")
+            ok += 1
+            await asyncio.sleep(0.05)
+        except:
+            fail += 1
     
     await message.answer(
-        f"✅ **Рассылка завершена**\n\n"
-        f"✓ Доставлено: {success}\n"
-        f"✗ Ошибок: {failed}",
+        f"✅ <b>Рассылка завершена</b>\n\n"
+        f"✓ Доставлено: <b>{ok}</b>\n"
+        f"✗ Ошибок: <b>{fail}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« В админку", callback_data="admin")]
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
         ]),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     await state.clear()
 
 
-@dp.callback_query(F.data == "admin:users")
-async def cb_admin_users(call: types.CallbackQuery):
-    if call.from_user.id != OWNER_ID:
+@dp.callback_query(F.data == "adm:users")
+async def cb_adm_users(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
         return
-    users = get_all_users()[:10]  # Первые 10
+    users = get_all_users()[:15]
     if not users:
         text = "👥 Пользователей пока нет"
     else:
-        text = "👥 **Последние пользователи:**\n\n"
+        text = f"👥 <b>Последние пользователи ({len(get_all_users())})</b>\n\n"
         for u in users:
-            status = "🚫" if u[3] else "✓"
-            text += f"{status} <code>{u[0]}</code> — @{u[1] or 'нет'}\n"
-        if len(get_all_users()) > 10:
-            text += f"\n...и ещё {len(get_all_users()) - 10}"
+            ban = "🚫" if u[4] else "✓"
+            adm = "🛡" if u[3] else ""
+            uname = f"@{u[1]}" if u[1] else "—"
+            text += f"{ban}{adm} <code>{u[0]}</code> {uname} ({u[2] or '—'})\n"
     
     await call.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Назад", callback_data="admin")]
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
         ]),
         parse_mode="HTML"
     )
 
 
-@dp.callback_query(F.data == "admin:ban")
-async def cb_admin_ban(call: types.CallbackQuery, state: FSMContext):
-    if call.from_user.id != OWNER_ID:
+@dp.callback_query(F.data == "adm:ban")
+async def cb_adm_ban(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
         return
     await call.message.edit_text(
-        "🚫 **Блокировка пользователя**\n\n"
-        "Отправь ID или @username пользователя для блокировки.\n"
-        "Пример: <code>123456789</code> или <code>@username</code>\n\n"
-        "Для отмены: /cancel",
+        "🚫 <b>Блокировка</b>\n\n"
+        "Отправь ID или @username\n"
+        "Отмена: /cancel",
         parse_mode="HTML"
     )
-    await state.set_state("ban_user")
+    await state.set_state("ban")
 
 
-@dp.message(F.state("ban_user"))
+@dp.message(F.state("ban"))
 async def handle_ban(message: types.Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
+    if not is_admin(message.from_user.id):
         return
+    if message.text == "/cancel":
+        await state.clear()
+        return await message.answer("❌ Отменено")
     
     text = message.text.strip()
-    if text == "/cancel":
-        await message.answer("❌ Отменено")
-        await state.clear()
-        return
-    
-    # Если username
     if text.startswith("@"):
         conn = get_db()
         c = conn.cursor()
@@ -815,83 +1249,232 @@ async def handle_ban(message: types.Message, state: FSMContext):
         row = c.fetchone()
         conn.close()
         if not row:
-            await message.answer("❌ Пользователь не найден")
-            return
-        user_id = row[0]
+            return await message.answer("❌ Не найден")
+        uid = row[0]
     else:
         try:
-            user_id = int(text)
-        except ValueError:
-            await message.answer("❌ Неверный формат")
-            return
+            uid = int(text)
+        except:
+            return await message.answer("❌ Неверный формат")
     
-    if user_id == OWNER_ID:
-        await message.answer("❌ Нельзя заблокировать владельца")
-        return
+    if uid == OWNER_ID:
+        return await message.answer("❌ Нельзя заблокировать владельца")
     
-    ban_user(user_id)
+    ban_user(uid)
+    # Остановить его боты
+    for b in get_user_bots(uid):
+        await stop_user_bot(b[0])
+    
     await message.answer(
-        f"✅ Пользователь <code>{user_id}</code> заблокирован",
+        f"🚫 <b>Заблокирован:</b> <code>{uid}</code>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« В админку", callback_data="admin")]
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
         ]),
         parse_mode="HTML"
     )
     await state.clear()
 
 
-@dp.callback_query(F.data == "admin:unban")
-async def cb_admin_unban(call: types.CallbackQuery, state: FSMContext):
-    if call.from_user.id != OWNER_ID:
+@dp.callback_query(F.data == "adm:unban")
+async def cb_adm_unban(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
         return
     await call.message.edit_text(
-        "✅ **Разблокировка**\n\n"
-        "Отправь ID пользователя для разблокировки.\n\n"
-        "Для отмены: /cancel",
+        "✅ <b>Разблокировка</b>\n\n"
+        "Отправь ID\n"
+        "Отмена: /cancel",
         parse_mode="HTML"
     )
-    await state.set_state("unban_user")
+    await state.set_state("unban")
 
 
-@dp.message(F.state("unban_user"))
+@dp.message(F.state("unban"))
 async def handle_unban(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if message.text == "/cancel":
+        await state.clear()
+        return
+    try:
+        uid = int(message.text.strip())
+    except:
+        return await message.answer("❌ Неверный ID")
+    unban_user(uid)
+    await message.answer(
+        f"✅ <b>Разблокирован:</b> <code>{uid}</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+        ]),
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+
+# ─── Админы ───────────────────────────────────────────────
+
+@dp.callback_query(F.data == "adm:addadmin")
+async def cb_addadmin(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != OWNER_ID:
+        return await call.answer("⚠️ Только владелец", show_alert=True)
+    await call.message.edit_text(
+        "🛡 <b>Добавить админа</b>\n\n"
+        "Отправь ID или @username\n"
+        "Админ получит все права кроме управления другими админами.\n\n"
+        "Отмена: /cancel",
+        parse_mode="HTML"
+    )
+    await state.set_state("addadmin")
+
+
+@dp.message(F.state("addadmin"))
+async def handle_addadmin(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID:
         return
-    
-    text = message.text.strip()
-    if text == "/cancel":
-        await message.answer("❌ Отменено")
+    if message.text == "/cancel":
         await state.clear()
         return
     
-    try:
-        user_id = int(text)
-    except ValueError:
-        await message.answer("❌ Неверный ID")
-        return
+    text = message.text.strip()
+    if text.startswith("@"):
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE username = ?", (text[1:],))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return await message.answer("❌ Пользователь не найден. Пусть сначала напишет /start")
+        uid = row[0]
+    else:
+        try:
+            uid = int(text)
+        except:
+            return await message.answer("❌ Неверный формат")
     
-    unban_user(user_id)
+    if uid == OWNER_ID:
+        return await message.answer("⚠️ Владелец уже админ")
+    
+    add_admin(uid)
     await message.answer(
-        f"✅ Пользователь <code>{user_id}</code> разблокирован",
+        f"🛡 <b>Админ добавлен:</b> <code>{uid}</code>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« В админку", callback_data="admin")]
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
         ]),
         parse_mode="HTML"
     )
     await state.clear()
 
 
-@dp.callback_query(F.data == "admin:restart_all")
-async def cb_restart_all(call: types.CallbackQuery):
+@dp.callback_query(F.data == "adm:remadmin")
+async def cb_remadmin(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != OWNER_ID:
+        return await call.answer("⚠️ Только владелец", show_alert=True)
+    
+    admins = get_all_admins()
+    if not admins:
+        return await call.answer("📭 Админов нет", show_alert=True)
+    
+    buttons = []
+    for a in admins:
+        buttons.append([InlineKeyboardButton(
+            text=f"❌ {a[1] or a[2] or a[0]}",
+            callback_data=f"remadm:{a[0]}"
+        )])
+    buttons.append([InlineKeyboardButton(text="« Отмена", callback_data="admin")])
+    
+    await call.message.edit_text(
+        "❌ <b>Удалить админа</b>\n\nВыбери:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("remadm:"))
+async def cb_remadm_confirm(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return
-    await call.answer("Перезапускаю все боты...", show_alert=False)
+    uid = int(call.data.split(":")[1])
+    remove_admin(uid)
+    await call.answer("✅ Удалён")
+    await show_admin_panel(call.message, edit=True)
+
+
+# ─── Приветствие с картинкой ──────────────────────────────
+
+@dp.callback_query(F.data == "adm:welcome")
+async def cb_welcome(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != OWNER_ID:
+        return await call.answer("⚠️ Только владелец", show_alert=True)
     
-    # Остановить все
-    for bot_id in list(running_bots.keys()):
-        await stop_bot(bot_id)
+    status = "✅ Картинка установлена" if WELCOME_IMAGE.exists() else "📭 Картинки нет"
     
-    # Запустить заново всех активных
+    await call.message.edit_text(
+        f"🖼 <b>Приветствие</b>\n\n"
+        f"{status}\n\n"
+        f"Отправь <b>фото</b> для приветствия (вместо текущего текста).\n"
+        f"Или отправь <code>delete</code> чтобы удалить.\n\n"
+        f"Отмена: /cancel",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+        ]),
+        parse_mode="HTML"
+    )
+    await state.set_state("welcome_photo")
+
+
+@dp.message(F.state("welcome_photo"), F.photo)
+async def handle_welcome_photo(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    photo = message.photo[-1]  # Самое большое
+    file = await bot.get_file(photo.file_id)
+    await bot.download_file(file.file_path, WELCOME_IMAGE)
+    
+    await message.answer(
+        "✅ <b>Картинка приветствия установлена!</b>\n\n"
+        "Теперь все пользователи будут видеть её при /start",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+        ]),
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+
+@dp.message(F.state("welcome_photo"), F.text)
+async def handle_welcome_text(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    if message.text.strip().lower() == "delete":
+        if WELCOME_IMAGE.exists():
+            WELCOME_IMAGE.unlink()
+            await message.answer(
+                "🗑 <b>Картинка удалена</b>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+                ]),
+                parse_mode="HTML"
+            )
+        else:
+            await message.answer("📭 Картинки и так нет")
+    elif message.text == "/cancel":
+        await message.answer("❌ Отменено")
+    else:
+        await message.answer("❌ Отправь фото или 'delete'")
+        return
+    await state.clear()
+
+
+@dp.callback_query(F.data == "adm:restart")
+async def cb_restart_all(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+    await call.answer("⏳ Перезапускаю...")
+    
+    for bid in list(running_bots.keys()):
+        await stop_user_bot(bid)
+    
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT id, user_id, bot_token FROM bots")
@@ -899,21 +1482,20 @@ async def cb_restart_all(call: types.CallbackQuery):
     conn.close()
     
     restarted = 0
-    for b in all_bots:
-        bot_id, user_id, bot_token = b
-        if not is_user_banned(user_id):
-            bot_dir = BOTS_DIR / f"bot_{bot_id}"
-            code_file = bot_dir / "bot.py"
+    for bid, uid, token in all_bots:
+        if not is_user_banned(uid) and get_active_slots(uid):
+            code_file = BOTS_DIR / f"bot_{bid}" / "user_bot.py"
             if code_file.exists():
                 code = code_file.read_text(encoding="utf-8")
-                if await start_bot(bot_id, code, bot_token):
+                if await start_user_bot(bid, code, token):
                     restarted += 1
     
     await call.message.answer(
-        f"🔄 Перезапущено ботов: {restarted}",
+        f"🔄 <b>Перезапущено:</b> {restarted} ботов",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« В админку", callback_data="admin")]
-        ])
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+        ]),
+        parse_mode="HTML"
     )
 
 
@@ -923,287 +1505,20 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
     await message.answer("❌ Отменено")
 
 
-@dp.message(Command("balance"))
-async def cmd_balance(message: types.Message):
-    """💰 Проверить баланс звёзд бота (только для владельца)"""
-    if message.from_user.id != OWNER_ID:
-        return
-    
-    try:
-        # Получаем баланс через API
-        from aiogram.methods import GetMyCommands
-        # Для Stars нужен специальный запрос к API
-        # balance = await bot.get_star_transactions(offset=0, limit=1)
-        
-        await message.answer(
-            "💰 **Баланс звёзд бота**\n\n"
-            "Чтобы посмотреть баланс и вывести звёзды:\n\n"
-            "1. Открой @BotFather\n"
-            "2. Отправь /mybots\n"
-            "3. Выбери этого бота\n"
-            "4. Нажми **Bot Settings** → **Payments** → **Telegram Stars Balance**\n\n"
-            "Там увидишь:\n"
-            "• Текущий баланс\n"
-            "• Историю транзакций\n"
-            "• Кнопку вывода в TON\n\n"
-            "⚠️ **Важно:**\n"
-            "• Минимум для вывода: 1000 звёзд\n"
-            "• Период hold: до 21 дня\n"
-            "• Комиссия Telegram: ~30%",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-
-
-@dp.callback_query(F.data == "pricing")
-async def cb_pricing(call: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Неделя — 1⭐", callback_data="buy:week")],
-        [InlineKeyboardButton(text="📅 2 недели — 25⭐", callback_data="buy:2weeks")],
-        [InlineKeyboardButton(text="📅 Месяц — 50⭐", callback_data="buy:month")],
-        [InlineKeyboardButton(text="🎁 Оплатить подарком (быстрее!)", callback_data="gift_info")],
-        [InlineKeyboardButton(text="« Назад", callback_data="back")],
-    ])
-    await call.message.edit_text(
-        "💎 **Выберите тариф:**\n\n"
-        "🎁 **Совет:** оплатите подарком — так звёзды быстрее дойдут!",
-        reply_markup=kb,
-        parse_mode="Markdown"
-    )
-
-
-@dp.callback_query(F.data.startswith("buy:"))
-async def cb_buy(call: types.CallbackQuery):
-    plan = call.data.split(":")[1]
-    plan_data = PLANS[plan]
-    
-    await call.message.answer_invoice(
-        title=f"Слот на {plan_data['name']}",
-        description="1 ячейка для бота",
-        payload=f"slot_{plan}_{call.from_user.id}",
-        provider_token="",  # Пустой для Stars
-        currency="XTR",
-        prices=[LabeledPrice(label=f"Слот {plan_data['name']}", amount=plan_data['stars'])],
-    )
-
-
-@dp.pre_checkout_query()
-async def pre_checkout(query: types.PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(query.id, ok=True)
-
-
-@dp.message(F.successful_payment)
-async def on_payment(message: types.Message):
-    payload = message.successful_payment.invoice_payload
-    plan = payload.split("_")[1]
-    
-    create_payment(message.from_user.id, plan, message.successful_payment.total_amount)
-    create_slot(message.from_user.id, plan)
-    
-    await message.answer(f"✅ Оплата прошла! Слот на {PLANS[plan]['name']} активирован.")
-    
-    await bot.send_message(
-        OWNER_ID,
-        f"💰 Оплата от {message.from_user.full_name}: {PLANS[plan]['name']} ({message.successful_payment.total_amount}⭐)"
-    )
-
-
-@dp.callback_query(F.data == "gift_info")
-async def cb_gift_info(call: types.CallbackQuery):
-    await call.message.edit_text(
-        "🎁 **Оплата подарком**\n\n"
-        "1. Открой профиль владельца бота\n"
-        "2. Нажми '🎁 Подарить'\n"
-        "3. Выбери подарок:\n"
-        "   • 1+⭐ → Неделя\n"
-        "   • 25+⭐ → 2 недели\n"
-        "   • 50+⭐ → Месяц\n"
-        "4. Отправь подарок\n"
-        "5. Слот активируется автоматически!",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Назад", callback_data="back")]
-        ])
-    )
-
-
-@dp.callback_query(F.data == "upload")
-async def cb_upload(call: types.CallbackQuery, state: FSMContext):
-    if is_user_banned(call.from_user.id):
-        await call.answer("🚫 Вы заблокированы", show_alert=True)
-        return
-    slots = get_active_slots(call.from_user.id)
-    if not slots:
-        await call.answer("Нет активных слотов! Купи слот через /start", show_alert=True)
-        return
-    
-    await call.message.edit_text(
-        "📤 Отправь .py-файл бота.\n\n"
-        "⚠️ Токен указывай через `os.environ.get('BOT_TOKEN')`",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Отмена", callback_data="back")]
-        ])
-    )
-    await state.set_state(UploadStates.waiting_file)
-
-
-@dp.message(UploadStates.waiting_file, F.document)
-async def handle_file(message: types.Message, state: FSMContext):
-    doc = message.document
-    if not doc.file_name.endswith(".py"):
-        await message.answer("❌ Нужен .py-файл")
-        return
-    
-    file_info = await bot.get_file(doc.file_id)
-    file_bytes = await bot.download_file(file_info.file_path)
-    code = file_bytes.read().decode("utf-8")
-    
-    await state.update_data(code=code, filename=doc.file_name)
-    await message.answer("✅ Файл получен! Теперь отправь токен этого бота:")
-    await state.set_state(UploadStates.waiting_token)
-
-
-@dp.message(UploadStates.waiting_token, F.text)
-async def handle_token(message: types.Message, state: FSMContext):
-    token = message.text.strip()
-    if not token or ":" not in token:
-        await message.answer("❌ Неверный токен")
-        return
-    
-    data = await state.get_data()
-    bot_id = save_bot(message.from_user.id, data['filename'], token)
-    
-    # Сохраняем код
-    bot_dir = BOTS_DIR / f"bot_{bot_id}"
-    bot_dir.mkdir(exist_ok=True)
-    (bot_dir / "bot.py").write_text(data['code'], encoding="utf-8")
-    
-    await message.answer(
-        f"✅ Бот сохранён (ID: {bot_id})!\n"
-        f"Используй /mybots чтобы запустить.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🤖 Мои боты", callback_data="mybots")]
-        ])
-    )
-    await state.clear()
-
-
-@dp.callback_query(F.data == "mybots")
-async def cb_mybots(call: types.CallbackQuery):
-    bots = get_user_bots(call.from_user.id)
-    if not bots:
-        await call.message.edit_text(
-            "У тебя нет ботов. Используй /upload",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="« Назад", callback_data="back")]
-            ])
-        )
-        return
-    
-    buttons = []
-    for b in bots:
-        status = "🟢" if b[4] == "running" else "🔴"
-        buttons.append([InlineKeyboardButton(
-            text=f"{status} {b[2]} (#{b[0]})",
-            callback_data=f"bot:{b[0]}"
-        )])
-    
-    buttons.append([InlineKeyboardButton(text="« Назад", callback_data="back")])
-    await call.message.edit_text("🤖 **Твои боты:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-
-@dp.callback_query(F.data.startswith("bot:"))
-async def cb_bot_detail(call: types.CallbackQuery):
-    if is_user_banned(call.from_user.id):
-        return await call.answer("🚫 Вы заблокированы", show_alert=True)
-    
-    bot_id = int(call.data.split(":")[1])
-    bot_data = get_bot(bot_id)
-    if not bot_data:
-        return await call.answer("Бот не найден", show_alert=True)
-    
-    status = "🟢 работает" if bot_id in running_bots else "🔴 остановлен"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="▶️ Запустить", callback_data=f"start:{bot_id}")],
-        [InlineKeyboardButton(text="⏹ Остановить", callback_data=f"stop:{bot_id}")],
-        [InlineKeyboardButton(text="📄 Логи", callback_data=f"logs:{bot_id}")],
-        [InlineKeyboardButton(text="« Назад", callback_data="mybots")],
-    ])
-    await call.message.edit_text(
-        f"🤖 **Бот #{bot_id}**\n\n"
-        f"📁 Файл: {bot_data[2]}\n"
-        f"📊 Статус: {status}",
-        reply_markup=kb,
-        parse_mode="Markdown"
-    )
-
-
-@dp.callback_query(F.data.startswith("logs:"))
-async def cb_bot_logs(call: types.CallbackQuery):
-    bot_id = int(call.data.split(":")[1])
-    bot_data = get_bot(bot_id)
-    
-    # Проверка прав
-    if not bot_data or bot_data[1] != call.from_user.id:
-        if call.from_user.id != OWNER_ID:
-            return await call.answer("Нет доступа", show_alert=True)
-    
-    logs = get_bot_logs(bot_id, 30)
-    text = f"📄 **Логи бота #{bot_id}:**\n\n```\n{logs[:2000]}\n```"
-    
-    await call.message.answer(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bot_id}")]
-        ]),
-        parse_mode="Markdown"
-    )
-
-
-@dp.callback_query(F.data.startswith("start:"))
-async def cb_start_bot(call: types.CallbackQuery):
-    bot_id = int(call.data.split(":")[1])
-    bot_data = get_bot(bot_id)
-    
-    if not bot_data:
-        await call.answer("Бот не найден", show_alert=True)
-        return
-    
-    bot_dir = BOTS_DIR / f"bot_{bot_id}"
-    code = (bot_dir / "bot.py").read_text(encoding="utf-8")
-    
-    await call.answer("Запускаю...")
-    success = await start_bot(bot_id, code, bot_data[3])
-    
-    if success:
-        await call.message.edit_text(f"✅ Бот #{bot_id} запущен!")
-    else:
-        await call.message.edit_text(f"❌ Ошибка запуска")
-
-
-@dp.callback_query(F.data.startswith("stop:"))
-async def cb_stop_bot(call: types.CallbackQuery):
-    bot_id = int(call.data.split(":")[1])
-    await stop_bot(bot_id)
-    await call.message.edit_text(f"⏹ Бот #{bot_id} остановлен")
-
-
-@dp.callback_query(F.data == "back")
-async def cb_back(call: types.CallbackQuery):
-    await cmd_start(call.message)
-
-
-# === MAIN ===
+# ═══════════════════════════════════════════════════════════════
+# 🎯 MAIN
+# ═══════════════════════════════════════════════════════════════
 
 async def main():
     init_db()
+    logger.info("=" * 50)
     logger.info("🤖 BotHost запущен")
+    logger.info(f"👤 Владелец: {OWNER_ID}")
+    logger.info("=" * 50)
     
-    # Запускаем фоновые задачи
-    asyncio.create_task(check_gifts())      # Проверка подарков
-    asyncio.create_task(monitor_bots())     # Мониторинг ботов
+    asyncio.create_task(check_gifts())
+    asyncio.create_task(monitor_bots())
     
-    # Запускаем бота
     await dp.start_polling(bot)
 
 
