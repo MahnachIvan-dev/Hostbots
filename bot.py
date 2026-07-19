@@ -15,6 +15,7 @@ import subprocess
 import sqlite3
 import logging
 import signal
+import html
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List
@@ -424,9 +425,9 @@ async def start_user_bot(bot_id: int, code: str, user_bot_token: str) -> bool:
         # Сохраняем код пользователя
         (bot_dir / "user_bot.py").write_text(code, encoding="utf-8")
         
-        # Wrapper который запускает код пользователя
+        # Wrapper который запускает ЛЮБОЙ код пользователя
         wrapper = '''#!/usr/bin/env python3
-"""Wrapper для запуска бота пользователя — ловит ВСЕ ошибки"""
+"""Wrapper для запуска ЛЮБОГО кода пользователя"""
 import os
 import sys
 import signal
@@ -436,12 +437,13 @@ import traceback
 def log(msg):
     print(f"[BotHost] {msg}", flush=True)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    log("ERROR: BOT_TOKEN не установлен!")
-    sys.exit(1)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-log(f"Запуск бота, токен: {BOT_TOKEN[:10]}...")
+if BOT_TOKEN:
+    log(f"Запуск бота, токен: {BOT_TOKEN[:10]}...")
+else:
+    log("Запуск кода БЕЗ токена (обычный скрипт)")
+
 log(f"Python: {sys.version}")
 log(f"CWD: {os.getcwd()}")
 
@@ -641,14 +643,17 @@ async def monitor_bots():
                     
                     if row and row[0] != OWNER_ID:
                         logs = get_bot_logs(bot_id, 10)
+                        # Экранируем HTML символы в логах
+                        logs_safe = html.escape(logs[:500])
                         try:
                             await bot.send_message(
                                 row[0],
                                 f"⚠️ <b>Бот #{bot_id} упал</b>\n\n"
-                                f"Код: {code}\n<pre>{logs[:500]}</pre>",
+                                f"Код: {code}\n<pre>{logs_safe}</pre>",
                                 parse_mode="HTML"
                             )
-                        except: pass
+                        except Exception as e:
+                            logger.error(f"Не удалось отправить уведомление: {e}")
                 else:
                     # Проверка подписки/блокировки (но не для владельца и админов)
                     conn = get_db()
@@ -1150,49 +1155,82 @@ async def handle_welcome_text(message: types.Message, state: FSMContext):
 
 @dp.message(UploadStates.waiting_file, F.document)
 async def handle_file(message: types.Message, state: FSMContext):
+    """Принимаем ЛЮБОЙ Python-код — без жёсткой валидации"""
     doc = message.document
-    if not doc.file_name.endswith(".py"):
-        return await message.answer("❌ Нужен <b>.py-файл</b>", parse_mode="HTML")
     
-    if doc.file_size and doc.file_size > 200 * 1024:
-        return await message.answer("❌ Файл больше 200 КБ")
-    
-    file_info = await bot.get_file(doc.file_id)
-    file_bytes = await bot.download_file(file_info.file_path)
-    code = file_bytes.read().decode("utf-8")
-    
-    # Валидация
-    errors = []
-    tg_libs = ["aiogram", "telebot", "pyrogram", "telegram", "telethon"]
-    if not any(lib in code for lib in tg_libs):
-        errors.append("• Нет импортов Telegram-библиотек")
-    if "os.environ" not in code and "os.getenv" not in code:
-        errors.append("• Токен должен браться из os.environ.get('BOT_TOKEN')")
-    
-    if errors:
+    # Принимаем .py файлы (и .txt с кодом)
+    if not (doc.file_name.endswith(".py") or doc.file_name.endswith(".txt")):
         return await message.answer(
-            "❌ <b>Код не прошёл проверку:</b>\n\n" + "\n".join(errors),
+            "❌ Нужен <b>.py-файл</b> (Python код)",
             parse_mode="HTML"
         )
     
+    if doc.file_size and doc.file_size > 500 * 1024:
+        return await message.answer("❌ Файл больше 500 КБ")
+    
+    file_info = await bot.get_file(doc.file_id)
+    file_bytes = await bot.download_file(file_info.file_path)
+    code = file_bytes.read().decode("utf-8", errors="ignore")
+    
+    # Мягкие предупреждения (НЕ блокируют загрузку)
+    warnings = []
+    
+    # Проверяем есть ли хоть какой-то код
+    if not code.strip():
+        return await message.answer("❌ Файл пустой!")
+    
+    # Предупреждение если нет Telegram-библиотек
+    tg_libs = ["aiogram", "telebot", "pyrogram", "telegram", "telethon", "botogram", "grammy"]
+    if not any(lib in code.lower() for lib in tg_libs):
+        warnings.append("💡 Не найдены Telegram-библиотеки — это нормально для обычных скриптов")
+    
+    # Предупреждение если токен хардкоднут
+    import re
+    if re.search(r'\d{8,10}:[A-Za-z0-9_-]{35}', code):
+        warnings.append("⚠️ Обнаружен хардкоднутый токен — рекомендую использовать os.environ.get('BOT_TOKEN')")
+    
+    # Предупреждение если нет работы с окружением
+    if "os.environ" not in code and "os.getenv" not in code and "environ" not in code:
+        warnings.append("💡 Совет: используй os.environ для переменных окружения")
+    
+    # Сохраняем код
     await state.update_data(code=code, filename=doc.file_name)
-    await message.answer(
-        "✅ <b>Файл принят!</b>\n\n"
-        f"📁 {doc.file_name}\n\n"
-        "Теперь отправь <b>токен этого бота</b>.\n"
-        "🔒 Токен будет удалён из чата для безопасности.",
-        parse_mode="HTML"
-    )
+    
+    # Формируем ответ
+    response = f"✅ <b>Файл принят!</b>\n\n📁 {doc.file_name}\n📏 Размер: {len(code)} символов\n"
+    
+    if warnings:
+        response += "\n<b>Рекомендации:</b>\n" + "\n".join(warnings) + "\n"
+    
+    response += "\nТеперь отправь <b>токен бота</b> (если нужен).\n"
+    response += "Если токен не нужен — отправь <code>none</code>\n"
+    response += "🔒 Токен будет удалён из чата для безопасности."
+    
+    await message.answer(response, parse_mode="HTML")
     await state.set_state(UploadStates.waiting_token)
 
 
 @dp.message(UploadStates.waiting_token, F.text)
 async def handle_token(message: types.Message, state: FSMContext):
+    """Принимаем токен или 'none' если токен не нужен"""
     token = message.text.strip()
-    if not token or ":" not in token or len(token) < 40:
-        return await message.answer("❌ Неверный формат токена")
     
-    # Удаляем сообщение с токеном
+    # Если пользователь пишет "none" или "нет" — токен не нужен
+    if token.lower() in ["none", "нет", "no", "-", "skip", "пропустить"]:
+        token = ""
+        token_status = "🚫 Токен не требуется"
+    elif ":" not in token or len(token) < 30:
+        # Мягкая проверка токена
+        return await message.answer(
+            "⚠️ Похоже это не токен бота.\n\n"
+            "Формат: <code>1234567890:ABCdefGHIjklMNOpqrsTUVwxyz</code>\n\n"
+            "Если токен не нужен — отправь <code>none</code>",
+            parse_mode="HTML"
+        )
+    else:
+        token_status = "🔐 Токен принят"
+    
+    # Удаляем сообщение с токеном (безопасность)
     try:
         await message.delete()
     except: pass
@@ -1202,13 +1240,27 @@ async def handle_token(message: types.Message, state: FSMContext):
     
     bot_dir = BOTS_DIR / f"bot_{bot_id}"
     bot_dir.mkdir(exist_ok=True)
+    
+    # Сохраняем код как user_bot.py
+    filename = data['filename']
+    if not filename.endswith(".py"):
+        filename = "user_bot.py"
     (bot_dir / "user_bot.py").write_text(data['code'], encoding="utf-8")
     
     await message.answer(
-        f"✅ <b>Бот сохранён!</b>\n\n"
+        f"✅ <b>Код сохранён!</b>\n\n"
         f"🆔 ID: <code>{bot_id}</code>\n"
-        f"📁 Файл: {data['filename']}\n\n"
-        "Запусти через <b>«🤖 Мои боты»</b>",
+        f"📁 Файл: {data['filename']}\n"
+        f"{token_status}\n\n"
+        f"📦 Поддерживаемые библиотеки:\n"
+        f"• aiogram, telebot, pyrogram, telethon\n"
+        f"• python-telegram-bot, botogram\n"
+        f"• openai, anthropic, groq (AI)\n"
+        f"• requests, aiohttp, httpx (HTTP)\n"
+        f"• discord.py, twitchio (другие платформы)\n"
+        f"• asyncio, aiohttp, fastapi, flask\n"
+        f"• и любые другие из PyPI!\n\n"
+        f"Запусти через <b>«🤖 Мои боты»</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🤖 К моим ботам", callback_data="mybots")]
         ]),
@@ -1414,13 +1466,22 @@ async def cb_upload(call: types.CallbackQuery, state: FSMContext):
         return
     
     await call.message.edit_text(
-        "📤 <b>Загрузка бота</b>\n\n"
-        "Отправь <b>.py-файл</b>.\n\n"
-        "⚠️ <b>Важно:</b>\n"
-        "• Токен: <code>os.environ.get('BOT_TOKEN')</code>\n"
-        "• НЕ хардкодь токен!\n"
-        "• aiogram, telebot, pyrogram\n"
-        "• Макс. 200 КБ",
+        "📤 <b>Загрузка кода</b>\n\n"
+        "Отправь <b>.py-файл</b> — подойдёт ЛЮБОЙ Python код!\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "✅ <b>Что можно загрузить:</b>\n"
+        "• Telegram-боты (aiogram, telebot, pyrogram)\n"
+        "• Discord-боты (discord.py)\n"
+        "• AI-скрипты (OpenAI, Groq, Anthropic)\n"
+        "• Веб-серверы (FastAPI, Flask)\n"
+        "• Парсеры, скрипты, утилиты\n"
+        "• ЛЮБОЙ Python-код!\n\n"
+        "📦 <b>Библиотеки:</b> aiogram, telebot, pyrogram, "
+        "python-telegram-bot, openai, requests, aiohttp, "
+        "fastapi, discord.py, numpy, pandas и 50+ других\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💡 Токен можно не указывать — напиши <code>none</code>\n"
+        "📏 Макс. размер: 500 КБ",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="« Отмена", callback_data="back_main")]
         ]),
@@ -1514,7 +1575,9 @@ async def cb_start_bot(call: types.CallbackQuery, state: FSMContext):
         return await call.answer("❌ Файл не найден", show_alert=True)
     
     code = code_file.read_text(encoding="utf-8")
-    success = await start_user_bot(bot_id, code, b[3])
+    # b[3] — это токен (может быть пустой строкой)
+    user_bot_token = b[3] if b[3] else ""
+    success = await start_user_bot(bot_id, code, user_bot_token)
     
     if success:
         await call.message.answer(
@@ -1577,17 +1640,21 @@ async def cb_start_bot(call: types.CallbackQuery, state: FSMContext):
         elif "ImportError" in logs:
             error_hint = "\n\n💡 <b>Подсказка:</b> Ошибка импорта. Проверь названия библиотек."
         
-        # Формируем текст
+        # Формируем текст — ВАЖНО: экранируем HTML символы в логах!
         if not logs.strip():
             logs_text = "📭 Логи пустые (бот упал очень быстро)"
         else:
-            logs_text = logs[:2000]
+            # Экранируем < > & чтобы Telegram не парсил их как HTML теги
+            logs_text = html.escape(logs[:2000])
+        
+        # Также экранируем подсказку на всякий случай
+        error_hint_safe = error_hint  # уже содержит HTML разметку, не экранируем
         
         await call.message.answer(
             f"❌ <b>Бот #{bot_id} не запустился</b>\n\n"
             f"<b>📋 Логи:</b>\n"
             f"<pre>{logs_text}</pre>"
-            f"{error_hint}\n\n"
+            f"{error_hint_safe}\n\n"
             f"🔧 <b>Что делать:</b>\n"
             f"1. Проверь ошибку выше\n"
             f"2. Исправь код или настройки\n"
@@ -1614,17 +1681,22 @@ async def cb_stop_bot(call: types.CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("logs:"))
-async def cb_logs(call: types.CallbackQuery):
+async def cb_logs(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
     bot_id = int(call.data.split(":")[1])
     b = get_bot(bot_id)
     if not b or (b[1] != call.from_user.id and not is_admin(call.from_user.id)):
         return await call.answer("❌ Нет доступа", show_alert=True)
     
-    logs = get_bot_logs(bot_id, 30)
+    logs = get_bot_logs(bot_id, 50)
+    # Экранируем HTML символы чтобы Telegram не парсил <module> и подобное
+    logs_safe = html.escape(logs[:3000])
+    
     await call.message.answer(
-        f"📄 <b>Логи бота #{bot_id}</b>\n\n<pre>{logs[:2500]}</pre>",
+        f"📄 <b>Логи бота #{bot_id}</b>\n\n<pre>{logs_safe}</pre>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bot_id}")]
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"logs:{bot_id}")],
+            [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bot_id}")],
         ]),
         parse_mode="HTML"
     )
