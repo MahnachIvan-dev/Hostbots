@@ -1,4 +1,45 @@
+# Основные библиотеки BotHost
 aiogram>=3.0
 telethon
+cryptg
 aiohttp
+
+# Telegram библиотеки (разные варианты)
+python-telegram-bot
+pyTelegramBotAPI
+pyrogram
+
+# AI библиотеки
+openai
+anthropic
+google-generativeai
+
+# HTTP клиенты
+requests
+httpx
+
+# Другие платформы
+discord.py
+twitchio
+
+# Веб-фреймворки
+fastapi
+flask
+uvicorn
+
+# Утилиты
 python-dotenv
+pydantic
+schedule
+apscheduler
+
+# Базы данных
+sqlalchemy
+sqlite-utils
+motor
+pymongo
+redis
+
+# ML/Data
+numpy
+pandas
