@@ -425,7 +425,7 @@ async def start_user_bot(bot_id: int, code: str, user_bot_token: str) -> bool:
         (bot_dir / "user_bot.py").write_text(code, encoding="utf-8")
         
         # Wrapper который запускает код пользователя
-        # Использует exec() вместо importlib, чтобы все импорты работали
+        # Использует exec() чтобы все импорты работали
         wrapper = '''#!/usr/bin/env python3
 """Wrapper для запуска бота пользователя"""
 import os
@@ -442,8 +442,7 @@ print(f"[BotHost] Запуск бота, токен: {BOT_TOKEN[:10]}...")
 with open("user_bot.py", "r", encoding="utf-8") as f:
     user_code = f.read()
 
-# Выполняем код пользователя в глобальной области
-# Это нужно чтобы все импорты и функции работали
+# Выполняем код в глобальной области
 try:
     exec(user_code, {"__name__": "__main__", "__file__": "user_bot.py"})
     print("[BotHost] Код пользователя выполнен")
@@ -465,8 +464,9 @@ except Exception as e:
         env = os.environ.copy()
         env["BOT_TOKEN"] = user_bot_token
         env["PYTHONUNBUFFERED"] = "1"
-        # Убираем переменные хост-бота чтобы не конфликтовали
-        for k in ["OWNER_TELEGRAM_ID", "OWNER_PHONE", "OWNER_API_ID", "OWNER_API_HASH"]:
+        # Убираем только секретные переменные владельца
+        # GROQ_API_KEY, OPENAI_API_KEY и другие API ключи оставляем — они могут быть нужны ботам пользователей
+        for k in ["OWNER_TELEGRAM_ID", "OWNER_PHONE", "OWNER_API_ID", "OWNER_API_HASH", "OWNER_USERNAME"]:
             env.pop(k, None)
         
         # Запускаем процесс
@@ -482,11 +482,19 @@ except Exception as e:
         
         running_bots[bot_id] = process
         
-        # Ждём 2 секунды и проверяем что бот не упал сразу
-        await asyncio.sleep(2)
+        # Ждём 5 секунд и проверяем что бот не упал
+        # Даём время на инициализацию и возможные ошибки импорта
+        await asyncio.sleep(5)
+        
         if process.poll() is not None:
-            # Бот упал сразу — читаем логи
+            # Бот упал — читаем логи
             logs = log_file.read_text(encoding="utf-8", errors="ignore")
+            
+            # Если логи пустые — ждём ещё немного
+            if not logs.strip():
+                await asyncio.sleep(2)
+                logs = log_file.read_text(encoding="utf-8", errors="ignore")
+            
             logger.error(f"❌ Бот #{bot_id} упал при запуске:\n{logs}")
             
             conn = get_db()
@@ -494,9 +502,14 @@ except Exception as e:
             c.execute("UPDATE bots SET status = 'error' WHERE id = ?", (bot_id,))
             conn.commit()
             conn.close()
+            
+            # Удаляем из running_bots
+            if bot_id in running_bots:
+                del running_bots[bot_id]
+            
             return False
         
-        # Обновляем статус
+        # Бот работает — обновляем статус
         conn = get_db()
         c = conn.cursor()
         c.execute("UPDATE bots SET status = 'running' WHERE id = ?", (bot_id,))
@@ -751,34 +764,57 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
 
 
 async def send_welcome(target, edit: bool = False):
+    """Отправить приветствие с картинкой если есть"""
     user_id = target.from_user.id if hasattr(target, 'from_user') else target.chat.id
     name = target.from_user.first_name if hasattr(target, 'from_user') else "друг"
     text = WELCOME_TEXT.format(name=name)
     kb = main_menu_kb(user_id)
     
+    # Определяем chat_id
+    chat_id = target.chat.id if hasattr(target, 'chat') else user_id
+    
+    # Если есть картинка и пользователь не владелец — отправляем с фото
     if WELCOME_IMAGE.exists() and user_id != OWNER_ID:
         try:
+            # При edit=True удаляем старое сообщение
             if edit:
                 try:
                     await target.delete()
-                except: pass
-            await target.answer_photo(
-                photo=FSInputFile(WELCOME_IMAGE),
+                except Exception as e:
+                    logger.debug(f"Не удалось удалить сообщение: {e}")
+            
+            # Отправляем новое сообщение с фото в чат
+            photo = FSInputFile(WELCOME_IMAGE)
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
                 caption=text,
                 reply_markup=kb,
                 parse_mode="HTML"
             )
+            logger.info(f"✅ Отправлено приветствие с фото для {user_id}")
             return
         except Exception as e:
-            logger.error(f"Ошибка фото: {e}")
+            logger.error(f"❌ Ошибка отправки фото для {user_id}: {e}")
+            # Падение на текстовое сообщение ниже
     
+    # Текстовое приветствие
     if edit:
         try:
             await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
             return
-        except: pass
+        except Exception as e:
+            logger.debug(f"Не удалось отредактировать: {e}")
     
-    await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки приветствия: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1147,20 +1183,27 @@ async def handle_random_photo(message: types.Message):
 
 @dp.callback_query(F.data == "back_main")
 async def cb_back_main(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()
+    await state.clear()  # Очищаем состояние
+    
     if is_user_banned(call.from_user.id):
         return await call.answer("🚫 Вы заблокированы", show_alert=True)
     
+    # Удаляем старое сообщение
     try:
         await call.message.delete()
-    except: pass
+    except Exception as e:
+        logger.debug(f"Не удалось удалить сообщение: {e}")
+    
+    # Отправляем новое приветствие
     await send_welcome(call.message)
 
 
 # ─── Покупка слота ────────────────────────────────────────
 
 @dp.callback_query(F.data == "buy")
-async def cb_buy(call: types.CallbackQuery):
+async def cb_buy(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()  # Очищаем состояние
+    
     if is_user_banned(call.from_user.id):
         return await call.answer("🚫 Вы заблокированы", show_alert=True)
     
@@ -1207,7 +1250,8 @@ async def cb_buy(call: types.CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("plan:"))
-async def cb_plan(call: types.CallbackQuery):
+async def cb_plan(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()  # Очищаем состояние
     plan_id = call.data.split(":")[1]
     plan = PLANS[plan_id]
     link = get_profile_link()
@@ -1237,7 +1281,8 @@ async def cb_plan(call: types.CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("confirm:"))
-async def cb_confirm_payment(call: types.CallbackQuery):
+async def cb_confirm_payment(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()  # Очищаем состояние
     plan_id = call.data.split(":")[1]
     plan = PLANS[plan_id]
     user_id = call.from_user.id
@@ -1298,10 +1343,14 @@ async def cb_confirm_payment(call: types.CallbackQuery):
 
 @dp.callback_query(F.data == "upload")
 async def cb_upload(call: types.CallbackQuery, state: FSMContext):
+    # НЕ очищаем состояние здесь — мы сами его устанавливаем
+    
     if is_user_banned(call.from_user.id):
+        await state.clear()
         return await call.answer("🚫 Вы заблокированы", show_alert=True)
     
     if not has_active_slot(call.from_user.id):
+        await state.clear()
         await call.answer("❌ Нет активного слота!", show_alert=True)
         return
     
@@ -1324,7 +1373,8 @@ async def cb_upload(call: types.CallbackQuery, state: FSMContext):
 # ─── Мои боты ─────────────────────────────────────────────
 
 @dp.callback_query(F.data == "mybots")
-async def cb_mybots(call: types.CallbackQuery):
+async def cb_mybots(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()  # Очищаем состояние
     bots = get_user_bots(call.from_user.id)
     if not bots:
         await call.message.edit_text(
@@ -1384,7 +1434,9 @@ async def cb_bot_detail(call: types.CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("start:"))
-async def cb_start_bot(call: types.CallbackQuery):
+async def cb_start_bot(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()  # Очищаем состояние
+    
     bot_id = int(call.data.split(":")[1])
     b = get_bot(bot_id)
     if not b or b[1] != call.from_user.id:
@@ -1396,20 +1448,53 @@ async def cb_start_bot(call: types.CallbackQuery):
     if bot_id in running_bots:
         return await call.answer("⚠️ Уже запущен", show_alert=True)
     
-    await call.answer("⏳ Запускаю...")
+    await call.answer("⏳ Запускаю (это займёт ~5 секунд)...")
     
     code_file = BOTS_DIR / f"bot_{bot_id}" / "user_bot.py"
     if not code_file.exists():
         return await call.answer("❌ Файл не найден", show_alert=True)
     
     code = code_file.read_text(encoding="utf-8")
-    if await start_user_bot(bot_id, code, b[3]):
-        await call.message.answer(f"✅ <b>Бот #{bot_id} запущен!</b>", parse_mode="HTML")
-    else:
-        logs = get_bot_logs(bot_id, 15)
+    success = await start_user_bot(bot_id, code, b[3])
+    
+    if success:
         await call.message.answer(
-            f"❌ <b>Ошибка запуска #{bot_id}</b>\n\n<pre>{logs[:1000]}</pre>",
+            f"✅ <b>Бот #{bot_id} запущен!</b>\n\n"
+            f"🟢 Статус: работает\n"
+            f"⏱ Мониторинг активен",
             parse_mode="HTML"
+        )
+    else:
+        # Бот упал — показываем подробную ошибку
+        logs = get_bot_logs(bot_id, 25)
+        
+        # Определяем типичные проблемы
+        error_hint = ""
+        if "GROQ_API_KEY" in logs:
+            error_hint = "\n\n💡 <b>Подсказка:</b> Добавь <code>GROQ_API_KEY</code> в Railway Variables"
+        elif "OPENAI_API_KEY" in logs:
+            error_hint = "\n\n💡 <b>Подсказка:</b> Добавь <code>OPENAI_API_KEY</code> в Railway Variables"
+        elif "No module named" in logs:
+            error_hint = "\n\n💡 <b>Подсказка:</b> Недостающая библиотека. Пересдеплой Railway."
+        elif "BOT_TOKEN" in logs:
+            error_hint = "\n\n💡 <b>Подсказка:</b> Используй <code>os.environ.get('BOT_TOKEN')</code> в коде"
+        elif "SyntaxError" in logs or "IndentationError" in logs:
+            error_hint = "\n\n💡 <b>Подсказка:</b> Синтаксическая ошибка в коде"
+        elif "Invalid token" in logs or "Unauthorized" in logs:
+            error_hint = "\n\n💡 <b>Подсказка:</b> Неверный токен бота"
+        
+        await call.message.answer(
+            f"❌ <b>Бот #{bot_id} не запустился</b>\n\n"
+            f"<b>Причина:</b>\n"
+            f"<pre>{logs[:1500]}</pre>"
+            f"{error_hint}\n\n"
+            f"🔧 Исправь ошибку и попробуй снова.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"start:{bot_id}")],
+                [InlineKeyboardButton(text="📄 Логи", callback_data=f"logs:{bot_id}")],
+                [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bot_id}")],
+            ])
         )
 
 
@@ -1457,7 +1542,8 @@ async def cb_delete_bot(call: types.CallbackQuery):
 # ─── Мои слоты ────────────────────────────────────────────
 
 @dp.callback_query(F.data == "myslots")
-async def cb_myslots(call: types.CallbackQuery):
+async def cb_myslots(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()  # Очищаем состояние
     if call.from_user.id == OWNER_ID:
         await call.message.edit_text(
             "👑 <b>Твой слот:</b>\n\n"
@@ -1514,7 +1600,8 @@ async def cb_myslots(call: types.CallbackQuery):
 # ─── Помощь ───────────────────────────────────────────────
 
 @dp.callback_query(F.data == "help")
-async def cb_help(call: types.CallbackQuery):
+async def cb_help(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()  # Очищаем состояние
     link = get_profile_link()
     text = (
         "❓ <b>Помощь</b>\n\n"
@@ -1585,7 +1672,8 @@ async def show_admin_panel(message: types.Message, edit: bool = False):
 
 
 @dp.callback_query(F.data == "admin")
-async def cb_admin(call: types.CallbackQuery):
+async def cb_admin(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()  # Очищаем состояние
     if not is_admin(call.from_user.id):
         return await call.answer("🔐 Нет прав", show_alert=True)
     await show_admin_panel(call.message, edit=True)
