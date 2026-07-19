@@ -54,7 +54,7 @@ BOTS_DIR.mkdir(exist_ok=True)
 
 # Тарифы
 PLANS = {
-    "week": {"name": "Неделя", "stars": 15, "days": 7},
+    "week": {"name": "Неделя", "stars": 1, "days": 7},
     "2weeks": {"name": "2 недели", "stars": 25, "days": 14},
     "month": {"name": "Месяц", "stars": 50, "days": 30},
 }
@@ -312,7 +312,7 @@ async def process_gift(sender_id: int, username: str, gift_value: int):
         plan = "month"
     elif gift_value >= 25:
         plan = "2weeks"
-    elif gift_value >= 15:
+    elif gift_value >= 1:
         plan = "week"
     else:
         return
@@ -359,9 +359,9 @@ async def cmd_start(message: types.Message):
     await message.answer(
         f"👋 Привет, {message.from_user.full_name}!\n\n"
         "Я бот для хостинга твоих Telegram-ботов.\n\n"
-        "💎 Купить слот — оплата через Stars\n"
-        "🎁 Оплата подарком — подари подарок владельцу\n"
-        "📤 Загрузить бота — загрузи .py файл\n\n"
+        "💎 **Купить слот** — оплата через Stars\n"
+        "🎁 **Оплата подарком** — подари подарок владельцу\n"
+        "📤 **Загрузить бота** — загрузи .py файл\n\n"
         "Выбери действие:",
         reply_markup=kb
     )
