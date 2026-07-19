@@ -425,35 +425,94 @@ async def start_user_bot(bot_id: int, code: str, user_bot_token: str) -> bool:
         (bot_dir / "user_bot.py").write_text(code, encoding="utf-8")
         
         # Wrapper который запускает код пользователя
-        # Использует exec() чтобы все импорты работали
         wrapper = '''#!/usr/bin/env python3
-"""Wrapper для запуска бота пользователя"""
+"""Wrapper для запуска бота пользователя — ловит ВСЕ ошибки"""
 import os
 import sys
+import signal
+import traceback
+
+# Логируем всё
+def log(msg):
+    print(f"[BotHost] {msg}", flush=True)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    print("[BotHost] ERROR: BOT_TOKEN не установлен")
+    log("ERROR: BOT_TOKEN не установлен!")
     sys.exit(1)
 
-print(f"[BotHost] Запуск бота, токен: {BOT_TOKEN[:10]}...")
+log(f"Запуск бота, токен: {BOT_TOKEN[:10]}...")
+log(f"Python: {sys.version}")
+log(f"CWD: {os.getcwd()}")
 
-# Читаем код пользователя
+# Проверяем что файл существует
+if not os.path.exists("user_bot.py"):
+    log("ERROR: user_bot.py не найден!")
+    sys.exit(1)
+
+log("Читаю код пользователя...")
 with open("user_bot.py", "r", encoding="utf-8") as f:
     user_code = f.read()
 
-# Выполняем код в глобальной области
+log(f"Код прочитан: {len(user_code)} символов")
+
+# Обработчик сигналов для graceful shutdown
+def handle_signal(signum, frame):
+    log(f"Получен сигнал {signum}, завершаюсь...")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, handle_signal)
+
+# Выполняем код пользователя
+log("Запускаю код пользователя...")
+sys.stdout.flush()
+
 try:
-    exec(user_code, {"__name__": "__main__", "__file__": "user_bot.py"})
-    print("[BotHost] Код пользователя выполнен")
+    # Создаём глобальный контекст с нужными переменными
+    globals_dict = {
+        "__name__": "__main__",
+        "__file__": os.path.abspath("user_bot.py"),
+        "__builtins__": __builtins__,
+    }
+    
+    # Компилируем и выполняем
+    code_obj = compile(user_code, "user_bot.py", "exec")
+    exec(code_obj, globals_dict)
+    
+    log("Код пользователя выполнен (main() завершился)")
+    
 except SystemExit as e:
-    print(f"[BotHost] Бот завершился с кодом: {e.code}")
-    sys.exit(e.code if e.code else 0)
-except Exception as e:
-    print(f"[BotHost] ОШИБКА: {type(e).__name__}: {e}")
-    import traceback
+    code = e.code if e.code is not None else 0
+    log(f"Бот завершился с кодом: {code}")
+    sys.exit(code)
+    
+except SyntaxError as e:
+    log(f"❌ СИНТАКСИЧЕСКАЯ ОШИБКА в коде:")
+    log(f"   Файл: {e.filename}, строка {e.lineno}")
+    log(f"   {e.msg}")
+    if e.text:
+        log(f"   Код: {e.text.strip()}")
+    sys.exit(1)
+    
+except ImportError as e:
+    log(f"❌ ОШИБКА ИМПОРТА: {e}")
+    log(f"   Проверь что библиотека установлена в Railway")
+    log(f"   Добавь её в requirements.txt и пересдеплой")
     traceback.print_exc()
     sys.exit(1)
+    
+except Exception as e:
+    log(f"❌ ОШИБКА: {type(e).__name__}: {e}")
+    log("Трейсбек:")
+    traceback.print_exc()
+    sys.exit(1)
+    
+except KeyboardInterrupt:
+    log("Прервано пользователем")
+    sys.exit(0)
+
+log("Завершение работы")
 '''
         (bot_dir / "wrapper.py").write_text(wrapper, encoding="utf-8")
         
@@ -482,17 +541,17 @@ except Exception as e:
         
         running_bots[bot_id] = process
         
-        # Ждём 5 секунд и проверяем что бот не упал
-        # Даём время на инициализацию и возможные ошибки импорта
-        await asyncio.sleep(5)
+        # Ждём 6 секунд и проверяем что бот не упал
+        # Даём время на инициализацию, импорт библиотек, подключение к API
+        await asyncio.sleep(6)
         
         if process.poll() is not None:
             # Бот упал — читаем логи
             logs = log_file.read_text(encoding="utf-8", errors="ignore")
             
-            # Если логи пустые — ждём ещё немного
+            # Если логи пустые — ждём ещё
             if not logs.strip():
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
                 logs = log_file.read_text(encoding="utf-8", errors="ignore")
             
             logger.error(f"❌ Бот #{bot_id} упал при запуске:\n{logs}")
@@ -1466,34 +1525,79 @@ async def cb_start_bot(call: types.CallbackQuery, state: FSMContext):
         )
     else:
         # Бот упал — показываем подробную ошибку
-        logs = get_bot_logs(bot_id, 25)
+        logs = get_bot_logs(bot_id, 40)
         
-        # Определяем типичные проблемы
+        # Определяем типичные проблемы и даём подсказки
         error_hint = ""
-        if "GROQ_API_KEY" in logs:
-            error_hint = "\n\n💡 <b>Подсказка:</b> Добавь <code>GROQ_API_KEY</code> в Railway Variables"
+        
+        if "Conflict" in logs or "getUpdates" in logs or "terminated by other" in logs:
+            error_hint = (
+                "\n\n🔴 <b>КОНФЛИКТ!</b>\n"
+                "Этот токен уже используется в другом боте.\n"
+                "Убедись что:\n"
+                "• Ты не запускаешь этот же бот где-то ещё\n"
+                "• Нет других инстансов с этим токеном\n"
+                "• Попробуй получить новый токен у @BotFather"
+            )
+        elif "Unauthorized" in logs or "Invalid token" in logs or "401" in logs:
+            error_hint = (
+                "\n\n🔴 <b>НЕВЕРНЫЙ ТОКЕН!</b>\n"
+                "Токен бота недействителен.\n"
+                "Удали бота и загрузи заново с правильным токеном."
+            )
+        elif "GROQ_API_KEY" in logs:
+            error_hint = (
+                "\n\n💡 <b>Подсказка:</b> Добавь <code>GROQ_API_KEY</code> в Railway:\n"
+                "Railway → твой проект → Variables → + New Variable"
+            )
         elif "OPENAI_API_KEY" in logs:
-            error_hint = "\n\n💡 <b>Подсказка:</b> Добавь <code>OPENAI_API_KEY</code> в Railway Variables"
+            error_hint = (
+                "\n\n💡 <b>Подсказка:</b> Добавь <code>OPENAI_API_KEY</code> в Railway Variables"
+            )
         elif "No module named" in logs:
-            error_hint = "\n\n💡 <b>Подсказка:</b> Недостающая библиотека. Пересдеплой Railway."
-        elif "BOT_TOKEN" in logs:
-            error_hint = "\n\n💡 <b>Подсказка:</b> Используй <code>os.environ.get('BOT_TOKEN')</code> в коде"
+            # Извлекаем имя модуля
+            import re
+            module_match = re.search(r"No module named '([^']+)'", logs)
+            module_name = module_match.group(1) if module_match else "библиотеку"
+            error_hint = (
+                f"\n\n💡 <b>Не хватает библиотеки:</b> <code>{module_name}</code>\n"
+                "Напиши владельцу чтобы добавил её в requirements.txt"
+            )
         elif "SyntaxError" in logs or "IndentationError" in logs:
-            error_hint = "\n\n💡 <b>Подсказка:</b> Синтаксическая ошибка в коде"
-        elif "Invalid token" in logs or "Unauthorized" in logs:
-            error_hint = "\n\n💡 <b>Подсказка:</b> Неверный токен бота"
+            error_hint = "\n\n💡 <b>Подсказка:</b> Синтаксическая ошибка в коде. Проверь отступы и скобки."
+        elif "NameError" in logs:
+            error_hint = "\n\n💡 <b>Подсказка:</b> Переменная не определена. Проверь код."
+        elif "ConnectionError" in logs or "Timeout" in logs:
+            error_hint = "\n\n💡 <b>Подсказка:</b> Ошибка сети. Попробуй ещё раз через минуту."
+        elif "BOT_TOKEN не установлен" in logs:
+            error_hint = (
+                "\n\n💡 <b>Подсказка:</b> Используй <code>os.environ.get('BOT_TOKEN')</code>\n"
+                "НЕ хардкодь токен в коде!"
+            )
+        elif "ImportError" in logs:
+            error_hint = "\n\n💡 <b>Подсказка:</b> Ошибка импорта. Проверь названия библиотек."
+        
+        # Формируем текст
+        if not logs.strip():
+            logs_text = "📭 Логи пустые (бот упал очень быстро)"
+        else:
+            logs_text = logs[:2000]
         
         await call.message.answer(
             f"❌ <b>Бот #{bot_id} не запустился</b>\n\n"
-            f"<b>Причина:</b>\n"
-            f"<pre>{logs[:1500]}</pre>"
+            f"<b>📋 Логи:</b>\n"
+            f"<pre>{logs_text}</pre>"
             f"{error_hint}\n\n"
-            f"🔧 Исправь ошибку и попробуй снова.",
+            f"🔧 <b>Что делать:</b>\n"
+            f"1. Проверь ошибку выше\n"
+            f"2. Исправь код или настройки\n"
+            f"3. Нажми «Попробовать снова»",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"start:{bot_id}")],
-                [InlineKeyboardButton(text="📄 Логи", callback_data=f"logs:{bot_id}")],
-                [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bot_id}")],
+                [InlineKeyboardButton(text="📄 Полные логи", callback_data=f"logs:{bot_id}")],
+                [InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"del:{bot_id}")],
+                [InlineKeyboardButton(text="« К списку", callback_data="mybots")],
             ])
         )
 
