@@ -426,16 +426,147 @@ async def start_user_bot(bot_id: int, code: str, user_bot_token: str) -> bool:
         (bot_dir / "user_bot.py").write_text(code, encoding="utf-8")
         
         # Wrapper который запускает ЛЮБОЙ код пользователя
+        # с АВТОМАТИЧЕСКОЙ установкой недостающих библиотек
         wrapper = '''#!/usr/bin/env python3
-"""Wrapper для запуска ЛЮБОГО кода пользователя"""
+"""Wrapper для запуска ЛЮБОГО кода пользователя с автоустановкой библиотек"""
 import os
 import sys
 import signal
 import traceback
+import re
+import subprocess
+import importlib
 
 # Логируем всё
 def log(msg):
     print(f"[BotHost] {msg}", flush=True)
+
+# Функция автоустановки недостающих библиотек
+def auto_install_missing(code_text):
+    """Анализирует код и устанавливает недостающие библиотеки"""
+    # Соответствие импортов → пакетам pip
+    # (имя модуля → имя пакета в pip)
+    module_to_package = {
+        # Telegram
+        "telegram": "python-telegram-bot",
+        "telebot": "pyTelegramBotAPI",
+        "pyrogram": "pyrogram",
+        "telethon": "telethon",
+        "aiogram": "aiogram",
+        "grammy": "grammy",  # не существует в Python, но оставим
+        
+        # AI
+        "openai": "openai",
+        "anthropic": "anthropic",
+        "google.generativeai": "google-generativeai",
+        "transformers": "transformers",
+        "torch": "torch",
+        
+        # HTTP
+        "requests": "requests",
+        "httpx": "httpx",
+        "aiohttp": "aiohttp",
+        "urllib3": "urllib3",
+        "beautifulsoup4": "bs4",  # импорт bs4 → пакет beautifulsoup4
+        "bs4": "beautifulsoup4",
+        "scrapy": "scrapy",
+        "selenium": "selenium",
+        "playwright": "playwright",
+        
+        # Discord и другие платформы
+        "discord": "discord.py",
+        "twitchio": "twitchio",
+        
+        # Веб (НЕ устанавливаем автоматически — путают Railway)
+        # fastapi, flask, django — пользователь ставит через subprocess
+        
+        # Базы данных
+        "sqlalchemy": "sqlalchemy",
+        "pymongo": "pymongo",
+        "motor": "motor",
+        "redis": "redis",
+        "sqlite3": None,  # встроено
+        "psycopg2": "psycopg2-binary",
+        
+        # ML/Data
+        "numpy": "numpy",
+        "pandas": "pandas",
+        "matplotlib": "matplotlib",
+        "PIL": "Pillow",
+        "cv2": "opencv-python",
+        "sklearn": "scikit-learn",
+        
+        # Утилиты
+        "dotenv": "python-dotenv",
+        "schedule": "schedule",
+        "apscheduler": "apscheduler",
+        "pydantic": "pydantic",
+        "yaml": "pyyaml",
+        "jwt": "PyJWT",
+        "aiofiles": "aiofiles",
+        "tqdm": "tqdm",
+        "rich": "rich",
+        "colorama": "colorama",
+    }
+    
+    # Находим все импорты в коде
+    # Паттерны: import xxx, from xxx import yyy, from xxx.yyy import zzz
+    import_pattern = re.compile(
+        r"^\\s*(?:import|from)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+        re.MULTILINE
+    )
+    
+    found_modules = set()
+    for match in import_pattern.finditer(code_text):
+        module = match.group(1)
+        found_modules.add(module)
+    
+    log(f"Найдены импорты: {', '.join(sorted(found_modules))}")
+    
+    # Проверяем какие уже установлены
+    to_install = []
+    for module in found_modules:
+        if module in ("__future__", "os", "sys", "time", "datetime", "json", 
+                      "re", "math", "random", "hashlib", "base64", "uuid",
+                      "threading", "multiprocessing", "subprocess", "asyncio",
+                      "logging", "pathlib", "typing", "collections", "functools",
+                      "itertools", "operator", "string", "io", "copy", "enum",
+                      "dataclasses", "abc", "contextlib", "traceback", "inspect",
+                      "signal", "socket", "http", "html", "urllib", "sqlite3",
+                      "csv", "zipfile", "tarfile", "gzip", "shutil", "tempfile",
+                      "struct", "codecs", "locale", "textwrap", "pprint"):
+            continue  # Встроенные модули
+        
+        package = module_to_package.get(module)
+        if package is None:
+            # Попробуем импортировать
+            try:
+                importlib.import_module(module)
+            except ImportError:
+                # Пакет не известен — попробуем установить по имени модуля
+                to_install.append(module)
+        else:
+            try:
+                importlib.import_module(module)
+            except ImportError:
+                to_install.append(package)
+    
+    # Удаляем дубликаты
+    to_install = list(dict.fromkeys(to_install))
+    
+    if to_install:
+        log(f"📦 Устанавливаю недостающие библиотеки: {', '.join(to_install)}")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check"] + to_install,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT
+            )
+            log(f"✅ Библиотеки установлены: {', '.join(to_install)}")
+        except subprocess.CalledProcessError as e:
+            log(f"⚠️ Не удалось установить некоторые библиотеки: {e}")
+    else:
+        log("✅ Все библиотеки уже установлены")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
@@ -457,6 +588,13 @@ with open("user_bot.py", "r", encoding="utf-8") as f:
     user_code = f.read()
 
 log(f"Код прочитан: {len(user_code)} символов")
+
+# Автоматическая установка недостающих библиотек
+log("Проверяю зависимости...")
+try:
+    auto_install_missing(user_code)
+except Exception as e:
+    log(f"⚠️ Ошибка автоустановки: {e}")
 
 # Обработчик сигналов для graceful shutdown
 def handle_signal(signum, frame):
