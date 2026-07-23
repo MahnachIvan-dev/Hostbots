@@ -1,0 +1,24 @@
+# Библиотеки для BotHost и запуска пользовательских Telegram-ботов
+
+# Telegram (для главного бота BotHost)
+aiogram==3.13.1
+telethon==1.37.0
+cryptg==0.5.0
+aiohttp==3.10.11
+
+# Telegram (для пользовательских ботов)
+python-telegram-bot==21.6
+pyTelegramBotAPI==4.25.0
+pyrogram==2.0.106
+TgCrypto==1.2.5
+
+# AI
+openai==1.55.3
+
+# HTTP
+requests==2.32.3
+httpx==0.28.1
+
+# Утилиты
+python-dotenv==1.0.1
+aiofiles==24.1.0
