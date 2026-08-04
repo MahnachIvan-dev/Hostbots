@@ -460,42 +460,98 @@ async def gift_received(sender_id: int, username: str,
 
 
 async def run_userbot():
-    """
-    Запускает Telethon userbot с поддержкой интерактивной авторизации.
-    Код/пароль вводится прямо в боте владельцем.
-    """
-    global _auth_code_future, _auth_password_future
-
-    if not all([OWNER_PHONE, OWNER_API_ID, OWNER_API_HASH]):
-        log.warning("⚠️ Userbot: нет OWNER_PHONE/API_ID/API_HASH")
+    if not all([OWNER_API_ID, OWNER_API_HASH, OWNER_SESSION]):
+        log.warning("⚠️ Нет OWNER_API_ID / OWNER_API_HASH / OWNER_SESSION")
         return
 
-    # Устанавливаем telethon если нет
     try:
-        import telethon
+        from telethon import TelegramClient, events
+        from telethon.sessions import StringSession
     except ImportError:
-        log.info("📦 Устанавливаю telethon...")
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install", "-q", "telethon"
-        ])
-
-    from telethon import TelegramClient, events
-    from telethon.errors import (
-        SessionPasswordNeededError,
-        PhoneCodeInvalidError,
-        PasswordHashInvalidError,
-        FloodWaitError,
-    )
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "telethon"])
+        from telethon import TelegramClient, events
+        from telethon.sessions import StringSession
 
     while True:
         try:
             client = TelegramClient(
-                str(SESSION_FILE),
+                StringSession(OWNER_SESSION),
                 int(OWNER_API_ID),
                 OWNER_API_HASH,
-                system_version="4.16.30-vxCUSTOM"
+                device_model="Railway Host",
+                system_version="Linux",
+                app_version="1.0"
             )
+
             userbot_status["client"] = client
+
+            await client.connect()
+
+            if not await client.is_user_authorized():
+                raise RuntimeError("OWNER_SESSION недействителен. Создай новую сессию.")
+
+            me = await client.get_me()
+            userbot_status["connected"] = True
+            userbot_status["phone"] = f"{me.first_name} ({OWNER_PHONE or 'session'})"
+
+            log.info(f"✅ Userbot подключён: {me.first_name} ({me.id})")
+
+            try:
+                await bot.send_message(
+                    OWNER_ID,
+                    f"✅ <b>Userbot подключён</b>\n\n"
+                    f"👤 {me.first_name} {me.last_name or ''}\n"
+                    f"🆔 <code>{me.id}</code>\n\n"
+                    f"Слежу за подарками и сообщениями.",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+            @client.on(events.Raw())
+            async def on_raw(update):
+                try:
+                    if not hasattr(update, "message"):
+                        return
+
+                    msg = update.message
+                    if not hasattr(msg, "action") or not msg.action:
+                        return
+
+                    action = msg.action
+                    action_name = type(action).__name__.lower()
+
+                    if not any(k in action_name for k in ["gift", "star", "premium"]):
+                        return
+
+                    from_id = getattr(msg, "from_id", None)
+                    if hasattr(from_id, "user_id"):
+                        sid = from_id.user_id
+                    elif isinstance(from_id, int):
+                        sid = from_id
+                    else:
+                        return
+
+                    if sid == OWNER_ID:
+                        return
+
+                    stars = _extract_stars(action)
+                    if stars <= 0:
+                        return
+
+                    try:
+                        entity = await client.get_entity(sid)
+                        uname = getattr(entity, "username", None) or getattr(entity, "first_name", str(sid))
+                    except Exception:
+                        uname = str(sid)
+
+                    gift_id = f"raw_{sid}_{msg.id}_{int(datetime.now().timestamp())}"
+                    await gift_received(sid, uname, stars, gift_id)
+
+                except Exception as e:
+                    log.error(f"raw handler: {e}")
+
+            @client.on(events.NewMessage(incoming=True))
 
             # ── Коллбэки для авторизации ──────────────────────
 
@@ -2551,7 +2607,8 @@ async def cb_adm_restart(call: types.CallbackQuery):
     )
 
 
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════
+# ══════════════════════════
 # 🎯 MAIN
 # ═══════════════════════════════════════════════════════════════
 
