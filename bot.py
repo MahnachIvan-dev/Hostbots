@@ -1,11 +1,13 @@
 """
-🤖 BotHost — хостинг Telegram-ботов (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+🤖 BotHost — хостинг Telegram-ботов (ПОЛНАЯ ВЕРСИЯ v2.0)
 
-✅ Все FSM состояния работают
-✅ Хост ботов работает
+✅ Автоматизация чатов (userbot через Telethon)
+✅ Подарки отслеживаются в реальном времени
+✅ При оформлении тарифа — автоподтверждение если подарок есть
+✅ Хост ботов — несколько файлов, размер до 10MB
+✅ Мульти-файловый хостинг (zip архивы)
 ✅ Админы — безлимит
 ✅ Данные сохраняются в SQLite
-✅ Рассылка обычным текстом
 """
 
 import os
@@ -16,9 +18,12 @@ import sqlite3
 import logging
 import signal
 import html
+import re
+import zipfile
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -45,13 +50,22 @@ DATA_DIR = Path("./data")
 BOTS_DIR = DATA_DIR / "bots"
 DB_PATH = DATA_DIR / "bot.db"
 WELCOME_IMAGE = DATA_DIR / "welcome.jpg"
+SESSIONS_DIR = DATA_DIR / "sessions"
+
 DATA_DIR.mkdir(exist_ok=True)
 BOTS_DIR.mkdir(exist_ok=True)
+SESSIONS_DIR.mkdir(exist_ok=True)
+
+# Лимиты файлов
+MAX_FILE_SIZE = 10 * 1024 * 1024   # 10 МБ на файл
+MAX_ZIP_SIZE = 50 * 1024 * 1024    # 50 МБ на zip архив
+MAX_FILES_PER_BOT = 20              # Максимум файлов в боте
+MAX_BOTS_PER_USER = 10              # Максимум ботов у одного пользователя
 
 PLANS = {
-    "week": {"name": "Неделя", "stars": 15, "days": 7, "emoji": "📅"},
+    "week":   {"name": "Неделя",   "stars": 15, "days": 7,  "emoji": "📅"},
     "2weeks": {"name": "2 недели", "stars": 25, "days": 14, "emoji": "📅"},
-    "month": {"name": "Месяц", "stars": 50, "days": 30, "emoji": "🗓"},
+    "month":  {"name": "Месяц",    "stars": 50, "days": 30, "emoji": "🗓"},
 }
 
 logging.basicConfig(
@@ -63,75 +77,99 @@ logger = logging.getLogger("BotHost")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+# Запущенные боты: bot_id -> subprocess.Popen
 running_bots: Dict[int, subprocess.Popen] = {}
+
+# Userbot (Telethon клиент) — глобальный
+userbot_client = None
+
+# Очередь подарков для мгновенного подтверждения
+# gift_queue[user_id] = [{"value": int, "gift_id": str, "ts": datetime}, ...]
+gift_queue: Dict[int, List[dict]] = {}
 
 
 # ═══════════════════════════════════════════════════════════════
-# 💾 БАЗА ДАННЫХ (SQLite — всё сохраняется после перезапуска)
+# 💾 БАЗА ДАННЫХ
 # ═══════════════════════════════════════════════════════════════
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            is_admin INTEGER DEFAULT 0,
-            is_banned INTEGER DEFAULT 0,
+            user_id    INTEGER PRIMARY KEY,
+            username   TEXT,
+            full_name  TEXT,
+            is_admin   INTEGER DEFAULT 0,
+            is_banned  INTEGER DEFAULT 0,
             created_at TEXT
         )
     """)
-    
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS slots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            plan TEXT,
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER,
+            plan       TEXT,
             expires_at TEXT,
             created_at TEXT,
-            gift_id TEXT
+            gift_id    TEXT
         )
     """)
-    
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS bots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            filename TEXT,
-            bot_token TEXT,
-            status TEXT DEFAULT 'stopped',
-            created_at TEXT
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id      INTEGER,
+            name         TEXT,
+            main_file    TEXT DEFAULT 'main.py',
+            bot_token    TEXT,
+            status       TEXT DEFAULT 'stopped',
+            created_at   TEXT,
+            file_count   INTEGER DEFAULT 1,
+            total_size   INTEGER DEFAULT 0
         )
     """)
-    
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS pending_gifts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            gift_value INTEGER,
-            gift_id TEXT UNIQUE,
-            status TEXT DEFAULT 'pending',
-            plan TEXT,
-            created_at TEXT
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER,
+            username    TEXT,
+            gift_value  INTEGER,
+            gift_id     TEXT UNIQUE,
+            status      TEXT DEFAULT 'pending',
+            plan        TEXT,
+            created_at  TEXT
         )
     """)
-    
+
     # Миграции
-    for col, sql in [
-        ("is_banned", "ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0"),
-        ("full_name", "ALTER TABLE users ADD COLUMN full_name TEXT"),
-    ]:
+    migrations = [
+        ("SELECT is_banned FROM users LIMIT 1",
+         "ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0"),
+        ("SELECT full_name FROM users LIMIT 1",
+         "ALTER TABLE users ADD COLUMN full_name TEXT"),
+        ("SELECT file_count FROM bots LIMIT 1",
+         "ALTER TABLE bots ADD COLUMN file_count INTEGER DEFAULT 1"),
+        ("SELECT total_size FROM bots LIMIT 1",
+         "ALTER TABLE bots ADD COLUMN total_size INTEGER DEFAULT 0"),
+        ("SELECT name FROM bots LIMIT 1",
+         "ALTER TABLE bots ADD COLUMN name TEXT"),
+        ("SELECT main_file FROM bots LIMIT 1",
+         "ALTER TABLE bots ADD COLUMN main_file TEXT DEFAULT 'main.py'"),
+    ]
+    for check_sql, alter_sql in migrations:
         try:
-            c.execute(f"SELECT {col} FROM users LIMIT 1")
+            c.execute(check_sql)
         except sqlite3.OperationalError:
             try:
-                c.execute(sql)
-            except: pass
-    
+                c.execute(alter_sql)
+            except Exception:
+                pass
+
     conn.commit()
     conn.close()
     logger.info("💾 БД инициализирована")
@@ -141,15 +179,14 @@ def get_db():
     return sqlite3.connect(DB_PATH)
 
 
-# ─── Пользователи ─────────────────────────────────────────
+# ─── Пользователи ─────────────────────────────────────────────
 
 def create_user(user_id: int, username: str, full_name: str = ""):
     conn = get_db()
     c = conn.cursor()
-    # Обновляем username и full_name при каждом входе
     c.execute(
-        "INSERT INTO users (user_id, username, full_name, created_at) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET username = ?, full_name = ?",
+        "INSERT INTO users (user_id, username, full_name, created_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET username=?, full_name=?",
         (user_id, username, full_name, datetime.now().isoformat(), username, full_name)
     )
     conn.commit()
@@ -167,10 +204,10 @@ def get_all_users():
 
 def is_user_banned(user_id: int) -> bool:
     if user_id == OWNER_ID:
-        return False  # Владелец не может быть забанен
+        return False
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,))
+    c.execute("SELECT is_banned FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
     conn.close()
     return bool(row and row[0])
@@ -179,7 +216,7 @@ def is_user_banned(user_id: int) -> bool:
 def ban_user(user_id: int):
     conn = get_db()
     c = conn.cursor()
-    c.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,))
+    c.execute("UPDATE users SET is_banned=1 WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -187,19 +224,19 @@ def ban_user(user_id: int):
 def unban_user(user_id: int):
     conn = get_db()
     c = conn.cursor()
-    c.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (user_id,))
+    c.execute("UPDATE users SET is_banned=0 WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
 
 
-# ─── Админы ───────────────────────────────────────────────
+# ─── Админы ───────────────────────────────────────────────────
 
 def is_admin(user_id: int) -> bool:
     if user_id == OWNER_ID:
         return True
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
+    c.execute("SELECT is_admin FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
     conn.close()
     return bool(row and row[0])
@@ -208,12 +245,11 @@ def is_admin(user_id: int) -> bool:
 def add_admin(user_id: int):
     conn = get_db()
     c = conn.cursor()
-    # Создаём пользователя если его нет
     c.execute(
-        "INSERT OR IGNORE INTO users (user_id, created_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO users (user_id, created_at) VALUES (?,?)",
         (user_id, datetime.now().isoformat())
     )
-    c.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?", (user_id,))
+    c.execute("UPDATE users SET is_admin=1 WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -221,7 +257,7 @@ def add_admin(user_id: int):
 def remove_admin(user_id: int):
     conn = get_db()
     c = conn.cursor()
-    c.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?", (user_id,))
+    c.execute("UPDATE users SET is_admin=0 WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -229,24 +265,24 @@ def remove_admin(user_id: int):
 def get_all_admins():
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT user_id, username, full_name FROM users WHERE is_admin = 1 AND user_id != ?", (OWNER_ID,))
+    c.execute(
+        "SELECT user_id, username, full_name FROM users WHERE is_admin=1 AND user_id!=?",
+        (OWNER_ID,)
+    )
     rows = c.fetchall()
     conn.close()
     return rows
 
 
-# ─── Слоты ────────────────────────────────────────────────
+# ─── Слоты ────────────────────────────────────────────────────
 
 def has_active_slot(user_id: int) -> bool:
-    """Проверить есть ли активный слот. Владелец и админы — безлимит"""
-    if user_id == OWNER_ID:
+    if user_id == OWNER_ID or is_admin(user_id):
         return True
-    if is_admin(user_id):
-        return True  # Админы — безлимит
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "SELECT COUNT(*) FROM slots WHERE user_id = ? AND expires_at > ?",
+        "SELECT COUNT(*) FROM slots WHERE user_id=? AND expires_at>?",
         (user_id, datetime.now().isoformat())
     )
     count = c.fetchone()[0]
@@ -262,7 +298,7 @@ def get_active_slots(user_id: int):
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "SELECT * FROM slots WHERE user_id = ? AND expires_at > ?",
+        "SELECT * FROM slots WHERE user_id=? AND expires_at>?",
         (user_id, datetime.now().isoformat())
     )
     rows = c.fetchall()
@@ -276,21 +312,25 @@ def create_slot(user_id: int, plan: str, gift_id: str = ""):
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO slots (user_id, plan, expires_at, created_at, gift_id) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO slots (user_id, plan, expires_at, created_at, gift_id) VALUES (?,?,?,?,?)",
         (user_id, plan, expires_at.isoformat(), datetime.now().isoformat(), gift_id)
     )
     conn.commit()
     conn.close()
+    return expires_at
 
 
-# ─── Боты ─────────────────────────────────────────────────
+# ─── Боты ─────────────────────────────────────────────────────
 
-def save_bot(user_id: int, filename: str, user_bot_token: str):
+def save_bot(user_id: int, name: str, main_file: str, user_bot_token: str,
+             file_count: int = 1, total_size: int = 0) -> int:
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO bots (user_id, filename, bot_token, created_at) VALUES (?, ?, ?, ?)",
-        (user_id, filename, user_bot_token, datetime.now().isoformat())
+        "INSERT INTO bots (user_id, name, main_file, bot_token, created_at, file_count, total_size) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (user_id, name, main_file, user_bot_token,
+         datetime.now().isoformat(), file_count, total_size)
     )
     bot_id = c.lastrowid
     conn.commit()
@@ -301,16 +341,25 @@ def save_bot(user_id: int, filename: str, user_bot_token: str):
 def get_user_bots(user_id: int):
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM bots WHERE user_id = ?", (user_id,))
+    c.execute("SELECT * FROM bots WHERE user_id=?", (user_id,))
     rows = c.fetchall()
     conn.close()
     return rows
 
 
+def get_user_bots_count(user_id: int) -> int:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM bots WHERE user_id=?", (user_id,))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+
 def get_bot(bot_id: int):
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM bots WHERE id = ?", (bot_id,))
+    c.execute("SELECT * FROM bots WHERE id=?", (bot_id,))
     row = c.fetchone()
     conn.close()
     return row
@@ -319,7 +368,15 @@ def get_bot(bot_id: int):
 def delete_bot_record(bot_id: int):
     conn = get_db()
     c = conn.cursor()
-    c.execute("DELETE FROM bots WHERE id = ?", (bot_id,))
+    c.execute("DELETE FROM bots WHERE id=?", (bot_id,))
+    conn.commit()
+    conn.close()
+
+
+def update_bot_main_file(bot_id: int, main_file: str):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE bots SET main_file=? WHERE id=?", (main_file, bot_id))
     conn.commit()
     conn.close()
 
@@ -333,14 +390,15 @@ def get_all_bots():
     return rows
 
 
-# ─── Подарки ──────────────────────────────────────────────
+# ─── Подарки ──────────────────────────────────────────────────
 
 def save_pending_gift(user_id: int, username: str, gift_value: int, gift_id: str) -> bool:
     conn = get_db()
     c = conn.cursor()
     try:
         c.execute(
-            "INSERT INTO pending_gifts (user_id, username, gift_value, gift_id, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO pending_gifts (user_id, username, gift_value, gift_id, created_at) "
+            "VALUES (?,?,?,?,?)",
             (user_id, username, gift_value, gift_id, datetime.now().isoformat())
         )
         conn.commit()
@@ -351,17 +409,36 @@ def save_pending_gift(user_id: int, username: str, gift_value: int, gift_id: str
     return success
 
 
-def get_pending_gift_for_plan(user_id: int, plan: str):
+def get_pending_gift_for_plan(user_id: int, plan: str) -> Optional[tuple]:
+    """
+    Ищет подарок за последние 30 минут — для мгновенного подтверждения.
+    Также смотрит старые неиспользованные подарки.
+    """
     required = PLANS[plan]["stars"]
     conn = get_db()
     c = conn.cursor()
+
+    # Сначала ищем свежий подарок (последние 30 минут)
+    cutoff = (datetime.now() - timedelta(minutes=30)).isoformat()
     c.execute(
-        """SELECT id, gift_value, gift_id FROM pending_gifts 
-           WHERE user_id = ? AND status = 'pending' AND gift_value >= ?
+        """SELECT id, gift_value, gift_id FROM pending_gifts
+           WHERE user_id=? AND status='pending' AND gift_value>=?
+             AND created_at >= ?
            ORDER BY created_at DESC LIMIT 1""",
-        (user_id, required)
+        (user_id, required, cutoff)
     )
     row = c.fetchone()
+
+    if not row:
+        # Ищем любой неиспользованный подарок
+        c.execute(
+            """SELECT id, gift_value, gift_id FROM pending_gifts
+               WHERE user_id=? AND status='pending' AND gift_value>=?
+               ORDER BY created_at DESC LIMIT 1""",
+            (user_id, required)
+        )
+        row = c.fetchone()
+
     conn.close()
     return row
 
@@ -370,133 +447,120 @@ def activate_gift(gift_db_id: int, plan: str):
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "UPDATE pending_gifts SET status = 'activated', plan = ? WHERE id = ?",
+        "UPDATE pending_gifts SET status='activated', plan=? WHERE id=?",
         (plan, gift_db_id)
     )
     conn.commit()
     conn.close()
 
 
-# ─── Статистика ───────────────────────────────────────────
+def check_realtime_gift(user_id: int, required_stars: int) -> Optional[dict]:
+    """
+    Проверяет очередь подарков в памяти (gift_queue).
+    Возвращает подарок если он есть и достаточной стоимости.
+    """
+    if user_id not in gift_queue:
+        return None
+    gifts = gift_queue[user_id]
+    # Фильтруем: только за последние 30 минут и достаточные по стоимости
+    cutoff = datetime.now() - timedelta(minutes=30)
+    for g in gifts:
+        if g["value"] >= required_stars and g["ts"] >= cutoff:
+            return g
+    return None
+
+
+# ─── Статистика ───────────────────────────────────────────────
 
 def get_stats():
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM users")
     total_users = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1")
+    c.execute("SELECT COUNT(*) FROM users WHERE is_banned=1")
     banned = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+    c.execute("SELECT COUNT(*) FROM users WHERE is_admin=1")
     admins = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM slots WHERE expires_at > ?", (datetime.now().isoformat(),))
+    c.execute("SELECT COUNT(*) FROM slots WHERE expires_at>?", (datetime.now().isoformat(),))
     active_slots = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM bots")
     total_bots = c.fetchone()[0]
-    c.execute("SELECT COUNT(*), COALESCE(SUM(gift_value), 0) FROM pending_gifts WHERE status = 'activated'")
+    c.execute(
+        "SELECT COUNT(*), COALESCE(SUM(gift_value),0) FROM pending_gifts WHERE status='activated'"
+    )
     gifts_row = c.fetchone()
     conn.close()
     return {
-        "total_users": total_users,
-        "banned": banned,
-        "admins": admins,
-        "active_slots": active_slots,
-        "total_bots": total_bots,
-        "running_bots": len(running_bots),
-        "total_gifts": gifts_row[0],
-        "total_stars": gifts_row[1],
+        "total_users":   total_users,
+        "banned":        banned,
+        "admins":        admins,
+        "active_slots":  active_slots,
+        "total_bots":    total_bots,
+        "running_bots":  len(running_bots),
+        "total_gifts":   gifts_row[0],
+        "total_stars":   gifts_row[1],
+        "userbot_status": "🟢 онлайн" if userbot_client and userbot_client.is_connected() else "🔴 офлайн",
     }
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🚀 СИСТЕМА ХОСТА (ИСПРАВЛЕННАЯ)
+# 🚀 СИСТЕМА ХОСТА
 # ═══════════════════════════════════════════════════════════════
 
-async def start_user_bot(bot_id: int, code: str, user_bot_token: str) -> bool:
-    """
-    Запускает бота пользователя.
-    
-    ВАЖНО: код пользователя выполняется напрямую через exec(),
-    чтобы все импорты работали (aiogram, telebot и т.д.)
-    """
-    try:
-        bot_dir = BOTS_DIR / f"bot_{bot_id}"
-        bot_dir.mkdir(exist_ok=True)
-        
-        # Сохраняем код пользователя
-        (bot_dir / "user_bot.py").write_text(code, encoding="utf-8")
-        
-        # Wrapper который запускает ЛЮБОЙ код пользователя
-        # с АВТОМАТИЧЕСКОЙ установкой недостающих библиотек
-        wrapper = '''#!/usr/bin/env python3
-"""Wrapper для запуска ЛЮБОГО кода пользователя с автоустановкой библиотек"""
-import os
-import sys
-import signal
-import traceback
-import re
-import subprocess
-import importlib
+def get_bot_dir(bot_id: int) -> Path:
+    d = BOTS_DIR / f"bot_{bot_id}"
+    d.mkdir(exist_ok=True)
+    return d
 
-# Логируем всё
+
+def list_bot_files(bot_id: int) -> List[Path]:
+    """Список всех файлов бота"""
+    bot_dir = get_bot_dir(bot_id)
+    files = []
+    for f in sorted(bot_dir.iterdir()):
+        if f.name not in ("wrapper.py", "bot.log") and f.is_file():
+            files.append(f)
+    return files
+
+
+def get_bot_total_size(bot_id: int) -> int:
+    """Общий размер всех файлов бота в байтах"""
+    return sum(f.stat().st_size for f in list_bot_files(bot_id))
+
+
+WRAPPER_CODE = '''#!/usr/bin/env python3
+"""BotHost Wrapper — универсальный запускальщик"""
+import os, sys, signal, traceback, re, subprocess, importlib
+
 def log(msg):
     print(f"[BotHost] {msg}", flush=True)
 
-# Функция автоустановки недостающих библиотек
-def auto_install_missing(code_text):
-    """Анализирует код и устанавливает недостающие библиотеки"""
-    # Соответствие импортов → пакетам pip
-    # (имя модуля → имя пакета в pip)
-    module_to_package = {
-        # Telegram
+def auto_install(code_text):
+    MODULE_MAP = {
         "telegram": "python-telegram-bot",
         "telebot": "pyTelegramBotAPI",
         "pyrogram": "pyrogram",
         "telethon": "telethon",
         "aiogram": "aiogram",
-        "grammy": "grammy",  # не существует в Python, но оставим
-        
-        # AI
         "openai": "openai",
         "anthropic": "anthropic",
-        "google.generativeai": "google-generativeai",
-        "transformers": "transformers",
-        "torch": "torch",
-        
-        # HTTP
         "requests": "requests",
         "httpx": "httpx",
         "aiohttp": "aiohttp",
-        "urllib3": "urllib3",
-        "beautifulsoup4": "bs4",  # импорт bs4 → пакет beautifulsoup4
         "bs4": "beautifulsoup4",
-        "scrapy": "scrapy",
-        "selenium": "selenium",
-        "playwright": "playwright",
-        
-        # Discord и другие платформы
         "discord": "discord.py",
         "twitchio": "twitchio",
-        
-        # Веб (НЕ устанавливаем автоматически — путают Railway)
-        # fastapi, flask, django — пользователь ставит через subprocess
-        
-        # Базы данных
         "sqlalchemy": "sqlalchemy",
         "pymongo": "pymongo",
         "motor": "motor",
         "redis": "redis",
-        "sqlite3": None,  # встроено
         "psycopg2": "psycopg2-binary",
-        
-        # ML/Data
         "numpy": "numpy",
         "pandas": "pandas",
         "matplotlib": "matplotlib",
         "PIL": "Pillow",
         "cv2": "opencv-python",
         "sklearn": "scikit-learn",
-        
-        # Утилиты
         "dotenv": "python-dotenv",
         "schedule": "schedule",
         "apscheduler": "apscheduler",
@@ -507,168 +571,137 @@ def auto_install_missing(code_text):
         "tqdm": "tqdm",
         "rich": "rich",
         "colorama": "colorama",
+        "groq": "groq",
+        "fastapi": "fastapi",
+        "flask": "flask",
+        "uvicorn": "uvicorn",
+        "starlette": "starlette",
     }
-    
-    # Находим все импорты в коде
-    # Паттерны: import xxx, from xxx import yyy, from xxx.yyy import zzz
-    import_pattern = re.compile(
-        r"^\\s*(?:import|from)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-        re.MULTILINE
-    )
-    
-    found_modules = set()
-    for match in import_pattern.finditer(code_text):
-        module = match.group(1)
-        found_modules.add(module)
-    
-    log(f"Найдены импорты: {', '.join(sorted(found_modules))}")
-    
-    # Проверяем какие уже установлены
+    BUILTINS = {
+        "os","sys","time","datetime","json","re","math","random","hashlib",
+        "base64","uuid","threading","multiprocessing","subprocess","asyncio",
+        "logging","pathlib","typing","collections","functools","itertools",
+        "operator","string","io","copy","enum","dataclasses","abc",
+        "contextlib","traceback","inspect","signal","socket","http","html",
+        "urllib","sqlite3","csv","zipfile","tarfile","gzip","shutil",
+        "tempfile","struct","codecs","locale","textwrap","pprint","pickle",
+        "shelve","hmac","secrets","decimal","fractions","statistics","heapq",
+        "__future__","importlib","ast","dis","gc","weakref","types",
+    }
+    pattern = re.compile(r"^\\s*(?:import|from)\\s+([a-zA-Z_][a-zA-Z0-9_]*)", re.MULTILINE)
+    found = {m.group(1) for m in pattern.finditer(code_text)}
+    log(f"Импорты: {', '.join(sorted(found))}")
     to_install = []
-    for module in found_modules:
-        if module in ("__future__", "os", "sys", "time", "datetime", "json", 
-                      "re", "math", "random", "hashlib", "base64", "uuid",
-                      "threading", "multiprocessing", "subprocess", "asyncio",
-                      "logging", "pathlib", "typing", "collections", "functools",
-                      "itertools", "operator", "string", "io", "copy", "enum",
-                      "dataclasses", "abc", "contextlib", "traceback", "inspect",
-                      "signal", "socket", "http", "html", "urllib", "sqlite3",
-                      "csv", "zipfile", "tarfile", "gzip", "shutil", "tempfile",
-                      "struct", "codecs", "locale", "textwrap", "pprint"):
-            continue  # Встроенные модули
-        
-        package = module_to_package.get(module)
-        if package is None:
-            # Попробуем импортировать
-            try:
-                importlib.import_module(module)
-            except ImportError:
-                # Пакет не известен — попробуем установить по имени модуля
-                to_install.append(module)
-        else:
-            try:
-                importlib.import_module(module)
-            except ImportError:
-                to_install.append(package)
-    
-    # Удаляем дубликаты
-    to_install = list(dict.fromkeys(to_install))
-    
+    for module in found:
+        if module in BUILTINS:
+            continue
+        pkg = MODULE_MAP.get(module, module)
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            to_install.append(pkg)
     if to_install:
-        log(f"📦 Устанавливаю недостающие библиотеки: {', '.join(to_install)}")
+        to_install = list(dict.fromkeys(to_install))
+        log(f"📦 Установка: {', '.join(to_install)}")
         try:
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check"] + to_install,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.STDOUT
+                [sys.executable, "-m", "pip", "install", "-q",
+                 "--disable-pip-version-check"] + to_install,
+                stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
             )
-            log(f"✅ Библиотеки установлены: {', '.join(to_install)}")
-        except subprocess.CalledProcessError as e:
-            log(f"⚠️ Не удалось установить некоторые библиотеки: {e}")
+            log(f"✅ Установлено: {', '.join(to_install)}")
+        except Exception as e:
+            log(f"⚠️ Ошибка установки: {e}")
     else:
-        log("✅ Все библиотеки уже установлены")
+        log("✅ Все зависимости есть")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+MAIN_FILE = os.environ.get("BOTHOST_MAIN_FILE", "main.py")
 
+log(f"Python {sys.version}")
+log(f"Главный файл: {MAIN_FILE}")
 if BOT_TOKEN:
-    log(f"Запуск бота, токен: {BOT_TOKEN[:10]}...")
-else:
-    log("Запуск кода БЕЗ токена (обычный скрипт)")
+    log(f"Токен: {BOT_TOKEN[:10]}...")
 
-log(f"Python: {sys.version}")
-log(f"CWD: {os.getcwd()}")
+if not os.path.exists(MAIN_FILE):
+    log(f"ERROR: {MAIN_FILE} не найден!")
+    files = [f for f in os.listdir(".") if f.endswith(".py") and f != "wrapper.py"]
+    if files:
+        MAIN_FILE = files[0]
+        log(f"Найден альтернативный файл: {MAIN_FILE}")
+    else:
+        log("Нет Python файлов для запуска!")
+        sys.exit(1)
 
-# Проверяем что файл существует
-if not os.path.exists("user_bot.py"):
-    log("ERROR: user_bot.py не найден!")
-    sys.exit(1)
-
-log("Читаю код пользователя...")
-with open("user_bot.py", "r", encoding="utf-8") as f:
+with open(MAIN_FILE, "r", encoding="utf-8") as f:
     user_code = f.read()
 
-log(f"Код прочитан: {len(user_code)} символов")
-
-# Автоматическая установка недостающих библиотек
+log(f"Код: {len(user_code)} символов")
 log("Проверяю зависимости...")
 try:
-    auto_install_missing(user_code)
+    auto_install(user_code)
 except Exception as e:
     log(f"⚠️ Ошибка автоустановки: {e}")
 
-# Обработчик сигналов для graceful shutdown
 def handle_signal(signum, frame):
-    log(f"Получен сигнал {signum}, завершаюсь...")
+    log(f"Сигнал {signum}, завершаюсь...")
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, handle_signal)
 signal.signal(signal.SIGINT, handle_signal)
 
-# Выполняем код пользователя
-log("Запускаю код пользователя...")
+log(f"Запускаю {MAIN_FILE}...")
 sys.stdout.flush()
 
 try:
-    # Создаём глобальный контекст с нужными переменными
     globals_dict = {
         "__name__": "__main__",
-        "__file__": os.path.abspath("user_bot.py"),
+        "__file__": os.path.abspath(MAIN_FILE),
         "__builtins__": __builtins__,
     }
-    
-    # Компилируем и выполняем
-    code_obj = compile(user_code, "user_bot.py", "exec")
+    code_obj = compile(user_code, MAIN_FILE, "exec")
     exec(code_obj, globals_dict)
-    
-    log("Код пользователя выполнен (main() завершился)")
-    
+    log("Завершено нормально")
 except SystemExit as e:
     code = e.code if e.code is not None else 0
-    log(f"Бот завершился с кодом: {code}")
+    log(f"SystemExit: {code}")
     sys.exit(code)
-    
 except SyntaxError as e:
-    log(f"❌ СИНТАКСИЧЕСКАЯ ОШИБКА в коде:")
-    log(f"   Файл: {e.filename}, строка {e.lineno}")
-    log(f"   {e.msg}")
-    if e.text:
-        log(f"   Код: {e.text.strip()}")
+    log(f"❌ СИНТАКСИС: {e.filename}:{e.lineno} — {e.msg}")
+    if e.text: log(f"   {e.text.strip()}")
     sys.exit(1)
-    
 except ImportError as e:
-    log(f"❌ ОШИБКА ИМПОРТА: {e}")
-    log(f"   Проверь что библиотека установлена в Railway")
-    log(f"   Добавь её в requirements.txt и пересдеплой")
+    log(f"❌ ИМПОРТ: {e}")
     traceback.print_exc()
     sys.exit(1)
-    
 except Exception as e:
     log(f"❌ ОШИБКА: {type(e).__name__}: {e}")
-    log("Трейсбек:")
     traceback.print_exc()
     sys.exit(1)
-    
 except KeyboardInterrupt:
-    log("Прервано пользователем")
+    log("Прервано")
     sys.exit(0)
-
-log("Завершение работы")
 '''
-        (bot_dir / "wrapper.py").write_text(wrapper, encoding="utf-8")
-        
-        # Файл логов
+
+
+async def start_user_bot(bot_id: int, user_bot_token: str, main_file: str = "main.py") -> bool:
+    """Запускает бота пользователя"""
+    try:
+        bot_dir = get_bot_dir(bot_id)
+
+        # Записываем wrapper
+        (bot_dir / "wrapper.py").write_text(WRAPPER_CODE, encoding="utf-8")
+
         log_file = bot_dir / "bot.log"
-        
-        # Окружение с токеном
+
         env = os.environ.copy()
-        env["BOT_TOKEN"] = user_bot_token
+        env["BOT_TOKEN"] = user_bot_token or ""
+        env["BOTHOST_MAIN_FILE"] = main_file
         env["PYTHONUNBUFFERED"] = "1"
-        # Убираем только секретные переменные владельца
-        # GROQ_API_KEY, OPENAI_API_KEY и другие API ключи оставляем — они могут быть нужны ботам пользователей
-        for k in ["OWNER_TELEGRAM_ID", "OWNER_PHONE", "OWNER_API_ID", "OWNER_API_HASH", "OWNER_USERNAME"]:
+        for k in ["OWNER_TELEGRAM_ID", "OWNER_PHONE", "OWNER_API_ID",
+                  "OWNER_API_HASH", "OWNER_USERNAME"]:
             env.pop(k, None)
-        
-        # Запускаем процесс
+
         with open(log_file, "w", encoding="utf-8") as lf:
             process = subprocess.Popen(
                 [sys.executable, "-u", "wrapper.py"],
@@ -678,46 +711,38 @@ log("Завершение работы")
                 stderr=subprocess.STDOUT,
                 start_new_session=True
             )
-        
+
         running_bots[bot_id] = process
-        
-        # Ждём 6 секунд и проверяем что бот не упал
-        # Даём время на инициализацию, импорт библиотек, подключение к API
-        await asyncio.sleep(6)
-        
+
+        # Ждём 7 секунд — даём время на запуск
+        await asyncio.sleep(7)
+
         if process.poll() is not None:
-            # Бот упал — читаем логи
             logs = log_file.read_text(encoding="utf-8", errors="ignore")
-            
-            # Если логи пустые — ждём ещё
             if not logs.strip():
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
                 logs = log_file.read_text(encoding="utf-8", errors="ignore")
-            
-            logger.error(f"❌ Бот #{bot_id} упал при запуске:\n{logs}")
-            
+
+            logger.error(f"❌ Бот #{bot_id} упал:\n{logs[-500:]}")
+
             conn = get_db()
             c = conn.cursor()
-            c.execute("UPDATE bots SET status = 'error' WHERE id = ?", (bot_id,))
+            c.execute("UPDATE bots SET status='error' WHERE id=?", (bot_id,))
             conn.commit()
             conn.close()
-            
-            # Удаляем из running_bots
-            if bot_id in running_bots:
-                del running_bots[bot_id]
-            
+
+            running_bots.pop(bot_id, None)
             return False
-        
-        # Бот работает — обновляем статус
+
         conn = get_db()
         c = conn.cursor()
-        c.execute("UPDATE bots SET status = 'running' WHERE id = ?", (bot_id,))
+        c.execute("UPDATE bots SET status='running' WHERE id=?", (bot_id,))
         conn.commit()
         conn.close()
-        
-        logger.info(f"✅ Бот #{bot_id} запущен (PID {process.pid})")
+
+        logger.info(f"✅ Бот #{bot_id} запущен (PID {process.pid}), главный файл: {main_file}")
         return True
-        
+
     except Exception as e:
         logger.error(f"❌ Ошибка запуска #{bot_id}: {e}")
         return False
@@ -727,36 +752,35 @@ async def stop_user_bot(bot_id: int):
     if bot_id in running_bots:
         proc = running_bots[bot_id]
         try:
-            # Отправляем SIGTERM всей группе процессов
             if proc.poll() is None:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             pass
         except Exception as e:
             logger.error(f"Ошибка остановки #{bot_id}: {e}")
         finally:
-            del running_bots[bot_id]
-    
+            running_bots.pop(bot_id, None)
+
     conn = get_db()
     c = conn.cursor()
-    c.execute("UPDATE bots SET status = 'stopped' WHERE id = ?", (bot_id,))
+    c.execute("UPDATE bots SET status='stopped' WHERE id=?", (bot_id,))
     conn.commit()
     conn.close()
     logger.info(f"⏹ Бот #{bot_id} остановлен")
 
 
-def get_bot_logs(bot_id: int, lines: int = 50) -> str:
-    log_file = BOTS_DIR / f"bot_{bot_id}" / "bot.log"
+def get_bot_logs(bot_id: int, lines: int = 60) -> str:
+    log_file = get_bot_dir(bot_id) / "bot.log"
     if not log_file.exists():
         return "📭 Логи пока пустые"
     try:
         content = log_file.read_text(encoding="utf-8", errors="ignore")
         log_lines = content.strip().split("\n")
-        return "\n".join(log_lines[-lines:]) or "📭 Логи пока пустые"
+        return "\n".join(log_lines[-lines:]) or "📭 Пусто"
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
@@ -769,155 +793,267 @@ async def monitor_bots():
             for bot_id, proc in list(running_bots.items()):
                 if proc.poll() is not None:
                     code = proc.returncode
-                    del running_bots[bot_id]
-                    
+                    running_bots.pop(bot_id, None)
+
                     conn = get_db()
                     c = conn.cursor()
-                    c.execute("UPDATE bots SET status = 'error' WHERE id = ?", (bot_id,))
-                    c.execute("SELECT user_id FROM bots WHERE id = ?", (bot_id,))
+                    c.execute("UPDATE bots SET status='error' WHERE id=?", (bot_id,))
+                    c.execute("SELECT user_id FROM bots WHERE id=?", (bot_id,))
                     row = c.fetchone()
                     conn.commit()
                     conn.close()
-                    
-                    if row and row[0] != OWNER_ID:
+
+                    if row:
+                        uid = row[0]
                         logs = get_bot_logs(bot_id, 10)
-                        # Экранируем HTML символы в логах
                         logs_safe = html.escape(logs[:500])
                         try:
                             await bot.send_message(
-                                row[0],
-                                f"⚠️ <b>Бот #{bot_id} упал</b>\n\n"
-                                f"Код: {code}\n<pre>{logs_safe}</pre>",
+                                uid,
+                                f"⚠️ <b>Бот #{bot_id} упал!</b>\n\n"
+                                f"Код выхода: {code}\n"
+                                f"<pre>{logs_safe}</pre>",
                                 parse_mode="HTML"
                             )
-                        except Exception as e:
-                            logger.error(f"Не удалось отправить уведомление: {e}")
+                        except Exception:
+                            pass
                 else:
-                    # Проверка подписки/блокировки (но не для владельца и админов)
+                    # Проверка слота
                     conn = get_db()
                     c = conn.cursor()
-                    c.execute("SELECT user_id FROM bots WHERE id = ?", (bot_id,))
+                    c.execute("SELECT user_id FROM bots WHERE id=?", (bot_id,))
                     row = c.fetchone()
                     conn.close()
-                    
                     if row:
                         uid = row[0]
                         if uid != OWNER_ID and not is_admin(uid):
                             if is_user_banned(uid) or not has_active_slot(uid):
                                 await stop_user_bot(bot_id)
+
         except Exception as e:
             logger.error(f"Мониторинг: {e}")
-        
+
         await asyncio.sleep(30)
 
 
 async def restore_running_bots():
-    """Восстанавливает запущенных ботов после перезапуска"""
-    logger.info("🔄 Восстановление ботов после перезапуска...")
+    """Восстанавливает ботов после перезапуска"""
+    logger.info("🔄 Восстановление ботов...")
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT id, user_id, bot_token, status FROM bots WHERE status = 'running'")
+    c.execute("SELECT id, user_id, bot_token, main_file FROM bots WHERE status='running'")
     bots_to_restore = c.fetchall()
     conn.close()
-    
+
     restored = 0
-    for bot_id, user_id, user_bot_token, status in bots_to_restore:
-        # Проверяем что пользователь не заблокирован и имеет слот
+    for bot_id, user_id, user_bot_token, main_file in bots_to_restore:
         if is_user_banned(user_id):
             continue
         if user_id != OWNER_ID and not is_admin(user_id) and not has_active_slot(user_id):
             continue
-        
-        code_file = BOTS_DIR / f"bot_{bot_id}" / "user_bot.py"
+        code_file = get_bot_dir(bot_id) / (main_file or "main.py")
         if code_file.exists():
-            code = code_file.read_text(encoding="utf-8")
-            if await start_user_bot(bot_id, code, user_bot_token):
+            if await start_user_bot(bot_id, user_bot_token or "", main_file or "main.py"):
                 restored += 1
-    
-    logger.info(f"✅ Восстановлено ботов: {restored}")
+
+    logger.info(f"✅ Восстановлено: {restored}")
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🎁 ПРОВЕРКА ПОДАРКОВ
+# 🎁 USERBOT — ОТСЛЕЖИВАНИЕ ПОДАРКОВ (Telethon)
 # ═══════════════════════════════════════════════════════════════
 
-async def check_gifts():
+async def start_userbot():
+    """
+    Запускает userbot для отслеживания подарков.
+    Автоматически подключается к аккаунту владельца.
+    """
+    global userbot_client
+
     if not all([OWNER_PHONE, OWNER_API_ID, OWNER_API_HASH]):
-        logger.warning("⚠️ Не настроены данные для подарков (OWNER_PHONE/API_ID/API_HASH)")
+        logger.warning("⚠️ OWNER_PHONE/API_ID/API_HASH не настроены — подарки не отслеживаются")
         return
-    
+
     try:
         from telethon import TelegramClient, events
-        
-        client = TelegramClient("owner_session", int(OWNER_API_ID), OWNER_API_HASH)
-        await client.start(phone=OWNER_PHONE)
-        logger.info(f"✅ Userbot подключен: {OWNER_PHONE}")
-        
-        @client.on(events.NewMessage(incoming=True))
-        async def on_msg(event):
+        from telethon.tl.types import (
+            MessageActionStarGift,
+            MessageActionStarGiftUnique,
+            MessageServiceAction,
+        )
+
+        session_path = str(SESSIONS_DIR / "owner_userbot")
+
+        userbot_client = TelegramClient(
+            session_path,
+            int(OWNER_API_ID),
+            OWNER_API_HASH
+        )
+
+        await userbot_client.start(phone=OWNER_PHONE)
+        me = await userbot_client.get_me()
+        logger.info(f"✅ Userbot запущен: {me.first_name} ({me.id})")
+
+        @userbot_client.on(events.NewMessage(incoming=True))
+        async def on_message(event):
+            """Ловим сервисные сообщения о подарках"""
             try:
-                if hasattr(event.message, 'action'):
-                    action = event.message.action
-                    action_type = str(type(action)).lower()
-                    if 'gift' in action_type:
+                msg = event.message
+
+                # Проверяем action (сервисное сообщение)
+                if hasattr(msg, "action") and msg.action is not None:
+                    action = msg.action
+                    action_type = type(action).__name__.lower()
+
+                    if "gift" in action_type or "star" in action_type:
                         sender = await event.get_sender()
-                        if sender and sender.id != OWNER_ID:
-                            value = getattr(action, 'stars', 0) or getattr(action, 'cost', 0) or 0
-                            gift_id = f"{event.id}_{event.chat_id}_{int(datetime.now().timestamp())}"
-                            await register_gift(sender.id, sender.username or sender.first_name, value, gift_id)
+                        if not sender or sender.id == OWNER_ID:
+                            return
+
+                        # Извлекаем стоимость
+                        value = 0
+                        for attr in ["stars", "cost", "amount", "credits"]:
+                            v = getattr(action, attr, None)
+                            if v and isinstance(v, int) and v > 0:
+                                value = v
+                                break
+
+                        if value <= 0:
+                            # Пробуем по gift атрибуту
+                            gift_obj = getattr(action, "gift", None)
+                            if gift_obj:
+                                for attr in ["stars", "cost"]:
+                                    v = getattr(gift_obj, attr, None)
+                                    if v and isinstance(v, int) and v > 0:
+                                        value = v
+                                        break
+
+                        if value > 0:
+                            gift_id = (
+                                f"gift_{sender.id}_{event.id}_"
+                                f"{int(datetime.now().timestamp())}"
+                            )
+                            await process_incoming_gift(
+                                sender_id=sender.id,
+                                username=(
+                                    sender.username
+                                    or sender.first_name
+                                    or str(sender.id)
+                                ),
+                                value=value,
+                                gift_id=gift_id
+                            )
+
             except Exception as e:
-                logger.error(f"Ошибка подарка: {e}")
-        
-        await client.run_until_disconnected()
+                logger.error(f"Ошибка обработки подарка: {e}")
+
+        # Также слушаем raw updates на случай новых типов подарков
+        @userbot_client.on(events.Raw())
+        async def on_raw(update):
+            try:
+                update_type = type(update).__name__.lower()
+                if "gift" in update_type:
+                    logger.debug(f"Raw gift update: {update_type}")
+            except Exception:
+                pass
+
+        logger.info("🎁 Userbot слушает подарки...")
+        await userbot_client.run_until_disconnected()
+
     except ImportError:
-        logger.warning("Telethon не установлен — отслеживание подарков отключено")
+        logger.warning("Telethon не установлен — устанавливаю...")
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "-q", "telethon"
+        ])
+        logger.info("Telethon установлен, перезапусти бота")
     except Exception as e:
-        logger.error(f"Userbot: {e}")
+        logger.error(f"Userbot ошибка: {e}")
 
 
-async def register_gift(user_id: int, username: str, value: int, gift_id: str):
-    if not save_pending_gift(user_id, username, value, gift_id):
+async def process_incoming_gift(sender_id: int, username: str,
+                                value: int, gift_id: str):
+    """
+    Обрабатывает входящий подарок:
+    1. Сохраняет в БД
+    2. Добавляет в очередь памяти (для мгновенного подтверждения)
+    3. Уведомляет отправителя
+    """
+    # Сохраняем в БД
+    is_new = save_pending_gift(sender_id, username, value, gift_id)
+    if not is_new:
+        logger.debug(f"Дубликат подарка: {gift_id}")
         return
-    
+
+    # Добавляем в очередь памяти
+    if sender_id not in gift_queue:
+        gift_queue[sender_id] = []
+    gift_queue[sender_id].append({
+        "value": value,
+        "gift_id": gift_id,
+        "ts": datetime.now()
+    })
+    # Чистим старые записи (> 2 часов)
+    cutoff = datetime.now() - timedelta(hours=2)
+    gift_queue[sender_id] = [
+        g for g in gift_queue[sender_id] if g["ts"] >= cutoff
+    ]
+
+    logger.info(f"🎁 Подарок получен: {sender_id} → {value}⭐")
+
+    # Определяем план
     if value >= 50:
-        plan_name = "Месяц"
+        plan_id, plan_name = "month", "Месяц"
     elif value >= 25:
-        plan_name = "2 недели"
+        plan_id, plan_name = "2weeks", "2 недели"
     elif value >= 15:
-        plan_name = "Неделя"
+        plan_id, plan_name = "week", "Неделя"
     else:
-        plan_name = None
-    
+        plan_id, plan_name = None, None
+
+    # Уведомляем пользователя
     try:
-        if plan_name:
+        if plan_id:
             await bot.send_message(
-                user_id,
+                sender_id,
                 f"🎁 <b>Подарок получен!</b>\n\n"
-                f"💎 Стоимость: <b>{value}⭐</b>\n\n"
-                f"✅ Вернись в бота и нажми <b>«💎 Купить слот»</b>,\n"
-                f"выбери тариф <b>{plan_name}</b> и нажми <b>«✅ Я отправил подарок»</b>",
-                parse_mode="HTML"
+                f"💎 Стоимость: <b>{value}⭐</b>\n"
+                f"✅ Тариф: <b>{plan_name}</b>\n\n"
+                f"Нажми кнопку ниже чтобы активировать тариф:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text=f"✅ Активировать {plan_name}",
+                        callback_data=f"confirm:{plan_id}"
+                    )],
+                    [InlineKeyboardButton(
+                        text="💎 Выбрать другой тариф",
+                        callback_data="buy"
+                    )],
+                ])
             )
         else:
             await bot.send_message(
-                user_id,
-                f"🎁 Спасибо за подарок ({value}⭐), но для слота нужно минимум 15⭐"
+                sender_id,
+                f"🎁 Спасибо за подарок ({value}⭐)!\n\n"
+                f"Но для слота нужно минимум 15⭐.\n"
+                f"Минимальный тариф — Неделя (15⭐)."
             )
     except Exception as e:
-        logger.error(f"Не удалось уведомить {user_id}: {e}")
-    
+        logger.error(f"Уведомление {sender_id}: {e}")
+
+    # Уведомляем владельца
     try:
         await bot.send_message(
             OWNER_ID,
             f"🎁 <b>Новый подарок!</b>\n\n"
-            f"👤 От: @{username or '—'} (<code>{user_id}</code>)\n"
-            f"💎 Стоимость: {value}⭐\n"
-            f"🆔 ID: <code>{gift_id}</code>",
+            f"👤 @{username} (<code>{sender_id}</code>)\n"
+            f"💎 {value}⭐\n"
+            f"📋 Тариф: {plan_name or 'недостаточно'}\n"
+            f"🆔 <code>{gift_id}</code>",
             parse_mode="HTML"
         )
-    except: pass
-    
-    logger.info(f"🎁 Подарок: {user_id} → {value}⭐")
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -941,10 +1077,13 @@ WELCOME_TEXT = """
 1️⃣ Нажми «💎 Купить слот»
 2️⃣ Выбери тариф
 3️⃣ Отправь подарок владельцу
-4️⃣ Подтверди оплату
+4️⃣ Тариф активируется автоматически!
 5️⃣ Загрузи своего бота ✨
 
 ━━━━━━━━━━━━━━━━━━━━━━━
+
+📦 Поддержка .py файлов и .zip архивов
+📏 Размер: до 10 МБ на файл, до 50 МБ zip
 
 Выбери действие ниже 👇
 """
@@ -958,34 +1097,27 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Мои слоты", callback_data="myslots")],
         [InlineKeyboardButton(text="❓ Помощь", callback_data="help")],
     ]
-    
     if is_admin(user_id):
-        buttons.append([InlineKeyboardButton(text="🔐 Админ-панель", callback_data="admin")])
-    
+        buttons.append([InlineKeyboardButton(
+            text="🔐 Админ-панель", callback_data="admin"
+        )])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 async def send_welcome(target, edit: bool = False):
-    """Отправить приветствие с картинкой если есть"""
-    user_id = target.from_user.id if hasattr(target, 'from_user') else target.chat.id
-    name = target.from_user.first_name if hasattr(target, 'from_user') else "друг"
-    text = WELCOME_TEXT.format(name=name)
+    user_id = target.from_user.id if hasattr(target, "from_user") else target.chat.id
+    name = target.from_user.first_name if hasattr(target, "from_user") else "друг"
+    text = WELCOME_TEXT.format(name=html.escape(name))
     kb = main_menu_kb(user_id)
-    
-    # Определяем chat_id
-    chat_id = target.chat.id if hasattr(target, 'chat') else user_id
-    
-    # Если есть картинка и пользователь не владелец — отправляем с фото
-    if WELCOME_IMAGE.exists() and user_id != OWNER_ID:
+    chat_id = target.chat.id if hasattr(target, "chat") else user_id
+
+    if WELCOME_IMAGE.exists():
         try:
-            # При edit=True удаляем старое сообщение
             if edit:
                 try:
                     await target.delete()
-                except Exception as e:
-                    logger.debug(f"Не удалось удалить сообщение: {e}")
-            
-            # Отправляем новое сообщение с фото в чат
+                except Exception:
+                    pass
             photo = FSInputFile(WELCOME_IMAGE)
             await bot.send_photo(
                 chat_id=chat_id,
@@ -994,29 +1126,21 @@ async def send_welcome(target, edit: bool = False):
                 reply_markup=kb,
                 parse_mode="HTML"
             )
-            logger.info(f"✅ Отправлено приветствие с фото для {user_id}")
             return
         except Exception as e:
-            logger.error(f"❌ Ошибка отправки фото для {user_id}: {e}")
-            # Падение на текстовое сообщение ниже
-    
-    # Текстовое приветствие
+            logger.error(f"Ошибка фото: {e}")
+
     if edit:
         try:
             await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
             return
-        except Exception as e:
-            logger.debug(f"Не удалось отредактировать: {e}")
-    
+        except Exception:
+            pass
+
     try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
-        logger.error(f"❌ Ошибка отправки приветствия: {e}")
+        logger.error(f"Ошибка приветствия: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1024,35 +1148,676 @@ async def send_welcome(target, edit: bool = False):
 # ═══════════════════════════════════════════════════════════════
 
 class UploadStates(StatesGroup):
-    waiting_file = State()
-    waiting_token = State()
+    waiting_file   = State()   # Ждём .py или .zip
+    waiting_main   = State()   # Ждём выбор главного файла (для zip)
+    waiting_token  = State()   # Ждём токен
+    add_file       = State()   # Добавление файла к существующему боту
 
 
 class AdminStates(StatesGroup):
-    broadcast = State()
-    ban = State()
-    unban = State()
-    addadmin = State()
-    welcome_photo = State()
+    broadcast      = State()
+    ban            = State()
+    unban          = State()
+    addadmin       = State()
+    welcome_photo  = State()
+    manual_gift    = State()   # Ручное добавление подарка
 
 
 # ═══════════════════════════════════════════════════════════════
-# 📱 ХЕНДЛЕРЫ (порядок важен: FSM хендлеры ДО общих)
+# ─── FSM ХЕНДЛЕРЫ ─────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════
 
-# ─── СТАРТ ─────────────────────────────────────────────────
+# ─── Рассылка ─────────────────────────────────────────────────
+
+@dp.message(AdminStates.broadcast)
+async def handle_broadcast(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if message.text == "/cancel":
+        await state.clear()
+        return await message.answer("❌ Отменено")
+
+    text = message.text or message.caption or ""
+    if not text:
+        return
+
+    await message.answer("⏳ Рассылаю...")
+    ok = fail = 0
+    for u in get_all_users():
+        if u[4]:   # is_banned
+            continue
+        try:
+            await bot.send_message(u[0], text)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+
+    await message.answer(
+        f"✅ Готово!\n✓ Доставлено: {ok}\n✗ Ошибок: {fail}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+        ])
+    )
+    await state.clear()
+
+
+# ─── Бан ──────────────────────────────────────────────────────
+
+@dp.message(AdminStates.ban)
+async def handle_ban(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if message.text == "/cancel":
+        await state.clear()
+        return await message.answer("❌ Отменено")
+
+    text = message.text.strip()
+    uid = None
+
+    if text.startswith("@"):
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE username=?", (text[1:],))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            uid = row[0]
+    else:
+        try:
+            uid = int(text)
+        except ValueError:
+            return await message.answer("❌ Неверный формат")
+
+    if not uid:
+        return await message.answer("❌ Пользователь не найден")
+    if uid == OWNER_ID:
+        return await message.answer("❌ Нельзя заблокировать владельца")
+
+    ban_user(uid)
+    for b in get_user_bots(uid):
+        await stop_user_bot(b[0])
+
+    await message.answer(
+        f"🚫 Заблокирован: <code>{uid}</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+        ])
+    )
+    await state.clear()
+
+
+# ─── Разбан ───────────────────────────────────────────────────
+
+@dp.message(AdminStates.unban)
+async def handle_unban(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if message.text == "/cancel":
+        await state.clear()
+        return await message.answer("❌ Отменено")
+
+    try:
+        uid = int(message.text.strip())
+    except ValueError:
+        return await message.answer("❌ Нужно число (ID)")
+
+    unban_user(uid)
+    await message.answer(
+        f"✅ Разблокирован: <code>{uid}</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+        ])
+    )
+    await state.clear()
+
+
+# ─── Добавление админа ────────────────────────────────────────
+
+@dp.message(AdminStates.addadmin)
+async def handle_addadmin(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        await state.clear()
+        return
+    if message.text == "/cancel":
+        await state.clear()
+        return await message.answer("❌ Отменено")
+
+    text = message.text.strip()
+    uid = None
+
+    if text.startswith("@"):
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE username=?", (text[1:],))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            uid = row[0]
+    else:
+        try:
+            uid = int(text)
+        except ValueError:
+            return await message.answer("❌ Неверный формат")
+
+    if not uid:
+        return await message.answer("❌ Не найден. Пусть напишет /start")
+    if uid == OWNER_ID:
+        return await message.answer("⚠️ Это уже владелец")
+
+    add_admin(uid)
+    await message.answer(
+        f"🛡 Админ добавлен: <code>{uid}</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+        ])
+    )
+    await state.clear()
+
+
+# ─── Фото приветствия ─────────────────────────────────────────
+
+@dp.message(AdminStates.welcome_photo, F.photo)
+async def handle_welcome_photo(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        await state.clear()
+        return
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    await bot.download_file(file.file_path, WELCOME_IMAGE)
+    await message.answer(
+        "✅ Картинка установлена!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+        ])
+    )
+    await state.clear()
+
+
+@dp.message(AdminStates.welcome_photo, F.text)
+async def handle_welcome_text(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        await state.clear()
+        return
+    if message.text.strip().lower() == "delete":
+        if WELCOME_IMAGE.exists():
+            WELCOME_IMAGE.unlink()
+        await message.answer(
+            "🗑 Картинка удалена",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+            ])
+        )
+        await state.clear()
+    elif message.text == "/cancel":
+        await message.answer("❌ Отменено")
+        await state.clear()
+    else:
+        await message.answer("❌ Отправь фото или напиши 'delete'")
+
+
+# ─── Ручное добавление подарка (для тестирования) ─────────────
+
+@dp.message(AdminStates.manual_gift)
+async def handle_manual_gift(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        await state.clear()
+        return
+    if message.text == "/cancel":
+        await state.clear()
+        return await message.answer("❌ Отменено")
+
+    # Формат: user_id stars
+    # Пример: 123456789 50
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        return await message.answer(
+            "❌ Формат: <code>user_id звёзды</code>\n"
+            "Пример: <code>123456789 50</code>",
+            parse_mode="HTML"
+        )
+
+    try:
+        uid = int(parts[0])
+        stars = int(parts[1])
+    except ValueError:
+        return await message.answer("❌ Нужны числа")
+
+    gift_id = f"manual_{uid}_{int(datetime.now().timestamp())}"
+    await process_incoming_gift(
+        sender_id=uid,
+        username=str(uid),
+        value=stars,
+        gift_id=gift_id
+    )
+
+    await message.answer(
+        f"✅ Подарок добавлен вручную:\n"
+        f"👤 <code>{uid}</code> — {stars}⭐",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
+        ])
+    )
+    await state.clear()
+
+
+# ═══════════════════════════════════════════════════════════════
+# ─── ЗАГРУЗКА ФАЙЛОВ (FSM) ────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+
+@dp.message(UploadStates.waiting_file, F.document)
+async def handle_upload_file(message: types.Message, state: FSMContext):
+    """Принимаем .py или .zip файл"""
+    doc = message.document
+    fname = doc.file_name or "file.py"
+
+    # Проверяем расширение
+    if not (fname.endswith(".py") or fname.endswith(".zip") or fname.endswith(".txt")):
+        return await message.answer(
+            "❌ Нужен <b>.py</b> файл или <b>.zip</b> архив",
+            parse_mode="HTML"
+        )
+
+    # Проверяем размер
+    max_size = MAX_ZIP_SIZE if fname.endswith(".zip") else MAX_FILE_SIZE
+    if doc.file_size and doc.file_size > max_size:
+        size_mb = max_size // (1024 * 1024)
+        return await message.answer(f"❌ Файл больше {size_mb} МБ")
+
+    # Проверяем лимит ботов
+    user_id = message.from_user.id
+    if not is_admin(user_id) and get_user_bots_count(user_id) >= MAX_BOTS_PER_USER:
+        return await message.answer(
+            f"❌ Максимум {MAX_BOTS_PER_USER} ботов.\n"
+            f"Удали старых чтобы загрузить нового."
+        )
+
+    # Скачиваем файл
+    file_info = await bot.get_file(doc.file_id)
+    file_bytes = await bot.download_file(file_info.file_path)
+    content = file_bytes.read()
+
+    if fname.endswith(".zip"):
+        # Обрабатываем zip архив
+        await handle_zip_upload(message, state, fname, content)
+    else:
+        # Обрабатываем Python файл
+        await handle_py_upload(message, state, fname, content)
+
+
+async def handle_py_upload(message: types.Message, state: FSMContext,
+                            fname: str, content: bytes):
+    """Обрабатывает загрузку .py файла"""
+    try:
+        code = content.decode("utf-8", errors="ignore")
+    except Exception:
+        return await message.answer("❌ Не удалось прочитать файл")
+
+    if not code.strip():
+        return await message.answer("❌ Файл пустой!")
+
+    warnings = []
+    tg_libs = ["aiogram", "telebot", "pyrogram", "telegram", "telethon"]
+    if not any(lib in code.lower() for lib in tg_libs):
+        warnings.append("💡 Не найдены Telegram-библиотеки")
+
+    if re.search(r"\d{8,10}:[A-Za-z0-9_-]{35}", code):
+        warnings.append("⚠️ Хардкоднутый токен — лучше использовать os.environ['BOT_TOKEN']")
+
+    # Нормализуем имя файла
+    safe_name = re.sub(r"[^\w.-]", "_", fname)
+    if not safe_name.endswith(".py"):
+        safe_name = "main.py"
+
+    await state.update_data(
+        files={"main.py": content},
+        main_file="main.py",
+        original_name=safe_name,
+        is_zip=False
+    )
+
+    resp = (
+        f"✅ <b>Файл принят!</b>\n\n"
+        f"📁 {fname}\n"
+        f"📏 {len(content):,} байт\n"
+    )
+    if warnings:
+        resp += "\n<b>Замечания:</b>\n" + "\n".join(warnings) + "\n"
+    resp += (
+        "\nТеперь отправь <b>токен бота</b>.\n"
+        "Если токен не нужен — отправь <code>none</code>"
+    )
+
+    await message.answer(resp, parse_mode="HTML")
+    await state.set_state(UploadStates.waiting_token)
+
+
+async def handle_zip_upload(message: types.Message, state: FSMContext,
+                             fname: str, content: bytes):
+    """Обрабатывает загрузку .zip архива"""
+    import io
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        return await message.answer("❌ Повреждённый zip архив")
+
+    # Получаем список Python файлов
+    py_files = [
+        n for n in zf.namelist()
+        if n.endswith(".py") and not n.startswith("__MACOSX")
+           and not os.path.basename(n).startswith(".")
+    ]
+
+    if not py_files:
+        return await message.answer("❌ В архиве нет .py файлов")
+
+    if len(py_files) > MAX_FILES_PER_BOT:
+        return await message.answer(
+            f"❌ Слишком много файлов: {len(py_files)}\n"
+            f"Максимум: {MAX_FILES_PER_BOT}"
+        )
+
+    # Читаем все файлы
+    files_data = {}
+    total_size = 0
+    for name in zf.namelist():
+        if name.endswith("/"):
+            continue
+        if any(skip in name for skip in ["__MACOSX", ".DS_Store", ".git/"]):
+            continue
+        try:
+            data = zf.read(name)
+            # Нормализуем путь
+            clean_name = name.lstrip("/").replace("\\", "/")
+            # Убираем лишние директории если архив из папки
+            parts = clean_name.split("/")
+            if len(parts) > 1 and len(py_files) > 0:
+                # Проверяем общий корень
+                roots = set(n.split("/")[0] for n in py_files if "/" in n)
+                if len(roots) == 1 and not any(
+                    n.count("/") == 0 for n in py_files
+                ):
+                    # Все файлы в одной папке — убираем корень
+                    root = roots.pop()
+                    if clean_name.startswith(root + "/"):
+                        clean_name = clean_name[len(root) + 1:]
+
+            files_data[clean_name] = data
+            total_size += len(data)
+        except Exception as e:
+            logger.error(f"Ошибка чтения {name}: {e}")
+
+    if total_size > MAX_ZIP_SIZE:
+        return await message.answer(
+            f"❌ Общий размер файлов: {total_size // 1024 // 1024} МБ\n"
+            f"Максимум: {MAX_ZIP_SIZE // 1024 // 1024} МБ"
+        )
+
+    # Определяем главный файл
+    py_names = [n for n in files_data.keys() if n.endswith(".py")]
+    main_candidates = ["main.py", "bot.py", "app.py", "run.py", "start.py", "index.py"]
+
+    detected_main = None
+    for candidate in main_candidates:
+        if candidate in py_names:
+            detected_main = candidate
+            break
+
+    if not detected_main and py_names:
+        detected_main = py_names[0]
+
+    await state.update_data(
+        files=files_data,
+        main_file=detected_main,
+        original_name=fname,
+        is_zip=True,
+        py_files=py_names
+    )
+
+    # Формируем список файлов
+    files_text = "\n".join(
+        f"{'👑' if n == detected_main else '📄'} {n}"
+        for n in sorted(py_names)[:15]
+    )
+    if len(py_names) > 15:
+        files_text += f"\n... и ещё {len(py_names) - 15}"
+
+    if len(py_names) > 1:
+        # Просим выбрать главный файл
+        buttons = []
+        for n in sorted(py_names)[:8]:
+            buttons.append([InlineKeyboardButton(
+                text=f"{'✅ ' if n == detected_main else ''}{n}",
+                callback_data=f"setmain:{n}"
+            )])
+        buttons.append([InlineKeyboardButton(
+            text="✅ Использовать автовыбор", callback_data="setmain:auto"
+        )])
+
+        await message.answer(
+            f"📦 <b>Архив принят!</b>\n\n"
+            f"📁 {fname}\n"
+            f"📏 {total_size:,} байт\n"
+            f"🐍 Python файлов: {len(py_names)}\n\n"
+            f"<b>Файлы:</b>\n{files_text}\n\n"
+            f"<b>Выбери главный файл</b> (точка входа):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="HTML"
+        )
+        await state.set_state(UploadStates.waiting_main)
+    else:
+        # Только один файл — сразу к токену
+        await message.answer(
+            f"📦 <b>Архив принят!</b>\n\n"
+            f"📁 {fname}\n"
+            f"📏 {total_size:,} байт\n"
+            f"🐍 Главный файл: <b>{detected_main}</b>\n\n"
+            f"Отправь <b>токен бота</b> или <code>none</code>",
+            parse_mode="HTML"
+        )
+        await state.set_state(UploadStates.waiting_token)
+
+
+@dp.callback_query(StateFilter(UploadStates.waiting_main), F.data.startswith("setmain:"))
+async def cb_set_main_file(call: types.CallbackQuery, state: FSMContext):
+    """Выбор главного файла из zip"""
+    choice = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    py_files = data.get("py_files", [])
+
+    if choice == "auto":
+        main_file = data.get("main_file") or py_files[0]
+    else:
+        main_file = choice
+
+    await state.update_data(main_file=main_file)
+
+    await call.message.edit_text(
+        f"✅ <b>Главный файл: {main_file}</b>\n\n"
+        f"Теперь отправь <b>токен бота</b> или <code>none</code>",
+        parse_mode="HTML"
+    )
+    await state.set_state(UploadStates.waiting_token)
+
+
+@dp.message(UploadStates.waiting_token, F.text)
+async def handle_token(message: types.Message, state: FSMContext):
+    """Принимаем токен или 'none'"""
+    token = message.text.strip()
+
+    if token.lower() in ["none", "нет", "no", "-", "skip", "пропустить", "0"]:
+        token = ""
+        token_status = "🚫 Токен не задан"
+    elif ":" not in token or len(token) < 30:
+        return await message.answer(
+            "⚠️ Это не токен бота.\n\n"
+            "Формат: <code>1234567890:ABCdef...</code>\n"
+            "Без токена — отправь <code>none</code>",
+            parse_mode="HTML"
+        )
+    else:
+        token_status = "🔐 Токен принят"
+
+    # Удаляем сообщение с токеном (безопасность)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    data = await state.get_data()
+    files: dict = data.get("files", {})
+    main_file: str = data.get("main_file", "main.py")
+    original_name: str = data.get("original_name", "bot.py")
+
+    user_id = message.from_user.id
+
+    # Создаём запись в БД
+    total_size = sum(len(v) for v in files.values())
+    bot_id = save_bot(
+        user_id=user_id,
+        name=original_name,
+        main_file=main_file,
+        user_bot_token=token,
+        file_count=len(files),
+        total_size=total_size
+    )
+
+    # Сохраняем файлы на диск
+    bot_dir = get_bot_dir(bot_id)
+    for rel_path, file_content in files.items():
+        # Безопасный путь (защита от path traversal)
+        safe_path = bot_dir / Path(rel_path).name
+        # Для вложенных папок
+        full_path = bot_dir / rel_path.lstrip("/")
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            full_path.write_bytes(file_content)
+        except Exception as e:
+            logger.error(f"Ошибка записи {rel_path}: {e}")
+
+    size_str = (
+        f"{total_size // 1024} КБ"
+        if total_size < 1024 * 1024
+        else f"{total_size / 1024 / 1024:.1f} МБ"
+    )
+
+    await message.answer(
+        f"✅ <b>Бот сохранён!</b>\n\n"
+        f"🆔 ID: <code>{bot_id}</code>\n"
+        f"📁 Архив: {original_name}\n"
+        f"🐍 Главный файл: <code>{main_file}</code>\n"
+        f"📄 Файлов: {len(files)}\n"
+        f"📏 Размер: {size_str}\n"
+        f"{token_status}\n\n"
+        f"Запусти через <b>«🤖 Мои боты»</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 К моим ботам", callback_data="mybots")],
+            [InlineKeyboardButton(text="📤 Загрузить ещё", callback_data="upload")],
+        ]),
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+
+# ─── Добавление файла к боту ──────────────────────────────────
+
+@dp.message(UploadStates.add_file, F.document)
+async def handle_add_file(message: types.Message, state: FSMContext):
+    """Добавление дополнительного файла к боту"""
+    data = await state.get_data()
+    bot_id = data.get("bot_id")
+    if not bot_id:
+        await state.clear()
+        return
+
+    b = get_bot(bot_id)
+    if not b or b[1] != message.from_user.id:
+        await state.clear()
+        return await message.answer("❌ Нет доступа")
+
+    doc = message.document
+    fname = doc.file_name or "file.py"
+
+    if not (fname.endswith(".py") or fname.endswith(".txt") or
+            fname.endswith(".json") or fname.endswith(".yaml") or
+            fname.endswith(".env") or fname.endswith(".cfg")):
+        return await message.answer(
+            "❌ Поддерживаются: .py, .txt, .json, .yaml, .cfg"
+        )
+
+    if doc.file_size and doc.file_size > MAX_FILE_SIZE:
+        return await message.answer(
+            f"❌ Файл больше {MAX_FILE_SIZE // 1024 // 1024} МБ"
+        )
+
+    bot_dir = get_bot_dir(bot_id)
+    current_files = list_bot_files(bot_id)
+    if len(current_files) >= MAX_FILES_PER_BOT:
+        return await message.answer(
+            f"❌ Максимум {MAX_FILES_PER_BOT} файлов в боте"
+        )
+
+    file_info = await bot.get_file(doc.file_id)
+    file_bytes = await bot.download_file(file_info.file_path)
+    content = file_bytes.read()
+
+    # Сохраняем файл
+    safe_name = re.sub(r"[^\w.\-]", "_", fname)
+    dest = bot_dir / safe_name
+    dest.write_bytes(content)
+
+    await message.answer(
+        f"✅ Файл добавлен: <code>{safe_name}</code>\n"
+        f"📏 {len(content):,} байт",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="📁 Файлы бота", callback_data=f"files:{bot_id}"
+            )],
+            [InlineKeyboardButton(
+                text="« К боту", callback_data=f"bot:{bot_id}"
+            )],
+        ])
+    )
+    await state.clear()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 📸 ФОТО НЕ В FSM
+# ═══════════════════════════════════════════════════════════════
+
+@dp.message(F.photo)
+async def handle_random_photo(message: types.Message):
+    await message.answer(
+        "📸 Для загрузки нужен <b>.py-файл</b> или <b>.zip-архив</b>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
+            [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
+        ]),
+        parse_mode="HTML"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# ─── КОМАНДЫ ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear()  # Очищаем любое состояние
-    
+    await state.clear()
     if is_user_banned(message.from_user.id):
-        await message.answer(
-            "🚫 <b>Вы заблокированы</b>\n\nВаш аккаунт заблокирован администрацией.",
+        return await message.answer(
+            "🚫 Вы заблокированы.",
             parse_mode="HTML"
         )
-        return
-    
     create_user(
         message.from_user.id,
         message.from_user.username or "",
@@ -1076,550 +1841,269 @@ async def cmd_admin(message: types.Message, state: FSMContext):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🔐 FSM ХЕНДЛЕРЫ (ДОЛЖНЫ БЫТЬ ДО ОБЩИХ!)
-# ═══════════════════════════════════════════════════════════════
-
-# ─── Загрузка бота ────────────────────────────────────────
-
-@dp.message(AdminStates.broadcast)
-async def handle_broadcast(message: types.Message, state: FSMContext):
-    """Рассылка — обычный текст БЕЗ HTML"""
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-    
-    if message.text == "/cancel":
-        await state.clear()
-        return await message.answer("❌ Отменено")
-    
-    text = message.text or message.caption or ""
-    if not text:
-        return
-    
-    await message.answer("⏳ Рассылаю...")
-    ok, fail = 0, 0
-    for u in get_all_users():
-        if u[4]: continue  # banned
-        try:
-            # ВАЖНО: БЕЗ parse_mode="HTML" — обычный текст!
-            await bot.send_message(u[0], text)
-            ok += 1
-            await asyncio.sleep(0.05)
-        except:
-            fail += 1
-    
-    await message.answer(
-        f"✅ Готово!\n✓ Доставлено: {ok}\n✗ Ошибок: {fail}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
-        ])
-    )
-    await state.clear()
-
-
-@dp.message(AdminStates.ban)
-async def handle_ban(message: types.Message, state: FSMContext):
-    """Блокировка пользователя"""
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-    
-    if message.text == "/cancel":
-        await state.clear()
-        return await message.answer("❌ Отменено")
-    
-    text = message.text.strip()
-    if not text:
-        return await message.answer("❌ Отправь ID или @username")
-    
-    if text.startswith("@"):
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT user_id FROM users WHERE username = ?", (text[1:],))
-        row = c.fetchone()
-        conn.close()
-        if not row:
-            return await message.answer(
-                "❌ Пользователь не найден в БД",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="« Админка", callback_data="admin")]
-                ])
-            )
-        uid = row[0]
-    else:
-        try:
-            uid = int(text)
-        except:
-            return await message.answer("❌ Неверный формат. Нужен ID (число) или @username")
-    
-    if uid == OWNER_ID:
-        return await message.answer("❌ Нельзя заблокировать владельца")
-    
-    ban_user(uid)
-    # Остановить его ботов
-    for b in get_user_bots(uid):
-        await stop_user_bot(b[0])
-    
-    await message.answer(
-        f"🚫 <b>Заблокирован:</b> <code>{uid}</code>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
-        ]),
-        parse_mode="HTML"
-    )
-    await state.clear()
-
-
-@dp.message(AdminStates.unban)
-async def handle_unban(message: types.Message, state: FSMContext):
-    """Разблокировка"""
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-    
-    if message.text == "/cancel":
-        await state.clear()
-        return await message.answer("❌ Отменено")
-    
-    try:
-        uid = int(message.text.strip())
-    except:
-        return await message.answer("❌ Неверный ID (нужно число)")
-    
-    unban_user(uid)
-    await message.answer(
-        f"✅ <b>Разблокирован:</b> <code>{uid}</code>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
-        ]),
-        parse_mode="HTML"
-    )
-    await state.clear()
-
-
-@dp.message(AdminStates.addadmin)
-async def handle_addadmin(message: types.Message, state: FSMContext):
-    """Добавление админа"""
-    if message.from_user.id != OWNER_ID:
-        await state.clear()
-        return
-    
-    if message.text == "/cancel":
-        await state.clear()
-        return await message.answer("❌ Отменено")
-    
-    text = message.text.strip()
-    if not text:
-        return await message.answer("❌ Отправь ID или @username")
-    
-    if text.startswith("@"):
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT user_id FROM users WHERE username = ?", (text[1:],))
-        row = c.fetchone()
-        conn.close()
-        if not row:
-            return await message.answer("❌ Не найден. Пусть напишет /start")
-        uid = row[0]
-    else:
-        try:
-            uid = int(text)
-        except:
-            return await message.answer("❌ Неверный формат")
-    
-    if uid == OWNER_ID:
-        return await message.answer("⚠️ Это уже владелец")
-    
-    add_admin(uid)
-    await message.answer(
-        f"🛡 <b>Админ добавлен:</b> <code>{uid}</code>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
-        ]),
-        parse_mode="HTML"
-    )
-    await state.clear()
-
-
-@dp.message(AdminStates.welcome_photo, F.photo)
-async def handle_welcome_photo(message: types.Message, state: FSMContext):
-    """Установка картинки приветствия"""
-    if message.from_user.id != OWNER_ID:
-        await state.clear()
-        return
-    
-    photo = message.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    await bot.download_file(file.file_path, WELCOME_IMAGE)
-    
-    await message.answer(
-        "✅ <b>Картинка установлена!</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Админка", callback_data="admin")]
-        ]),
-        parse_mode="HTML"
-    )
-    await state.clear()
-
-
-@dp.message(AdminStates.welcome_photo, F.text)
-async def handle_welcome_text(message: types.Message, state: FSMContext):
-    """Удаление картинки или отмена"""
-    if message.from_user.id != OWNER_ID:
-        await state.clear()
-        return
-    
-    if message.text.strip().lower() == "delete":
-        if WELCOME_IMAGE.exists():
-            WELCOME_IMAGE.unlink()
-            await message.answer(
-                "🗑 <b>Картинка удалена</b>",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="« Админка", callback_data="admin")]
-                ]),
-                parse_mode="HTML"
-            )
-        else:
-            await message.answer("📭 Картинки и так нет")
-        await state.clear()
-    elif message.text == "/cancel":
-        await message.answer("❌ Отменено")
-        await state.clear()
-    else:
-        await message.answer("❌ Отправь фото или напиши 'delete'")
-
-
-# ─── Загрузка файла бота (FSM) ────────────────────────────
-
-@dp.message(UploadStates.waiting_file, F.document)
-async def handle_file(message: types.Message, state: FSMContext):
-    """Принимаем ЛЮБОЙ Python-код — без жёсткой валидации"""
-    doc = message.document
-    
-    # Принимаем .py файлы (и .txt с кодом)
-    if not (doc.file_name.endswith(".py") or doc.file_name.endswith(".txt")):
-        return await message.answer(
-            "❌ Нужен <b>.py-файл</b> (Python код)",
-            parse_mode="HTML"
-        )
-    
-    if doc.file_size and doc.file_size > 500 * 1024:
-        return await message.answer("❌ Файл больше 500 КБ")
-    
-    file_info = await bot.get_file(doc.file_id)
-    file_bytes = await bot.download_file(file_info.file_path)
-    code = file_bytes.read().decode("utf-8", errors="ignore")
-    
-    # Мягкие предупреждения (НЕ блокируют загрузку)
-    warnings = []
-    
-    # Проверяем есть ли хоть какой-то код
-    if not code.strip():
-        return await message.answer("❌ Файл пустой!")
-    
-    # Предупреждение если нет Telegram-библиотек
-    tg_libs = ["aiogram", "telebot", "pyrogram", "telegram", "telethon", "botogram", "grammy"]
-    if not any(lib in code.lower() for lib in tg_libs):
-        warnings.append("💡 Не найдены Telegram-библиотеки — это нормально для обычных скриптов")
-    
-    # Предупреждение если токен хардкоднут
-    import re
-    if re.search(r'\d{8,10}:[A-Za-z0-9_-]{35}', code):
-        warnings.append("⚠️ Обнаружен хардкоднутый токен — рекомендую использовать os.environ.get('BOT_TOKEN')")
-    
-    # Предупреждение если нет работы с окружением
-    if "os.environ" not in code and "os.getenv" not in code and "environ" not in code:
-        warnings.append("💡 Совет: используй os.environ для переменных окружения")
-    
-    # Сохраняем код
-    await state.update_data(code=code, filename=doc.file_name)
-    
-    # Формируем ответ
-    response = f"✅ <b>Файл принят!</b>\n\n📁 {doc.file_name}\n📏 Размер: {len(code)} символов\n"
-    
-    if warnings:
-        response += "\n<b>Рекомендации:</b>\n" + "\n".join(warnings) + "\n"
-    
-    response += "\nТеперь отправь <b>токен бота</b> (если нужен).\n"
-    response += "Если токен не нужен — отправь <code>none</code>\n"
-    response += "🔒 Токен будет удалён из чата для безопасности."
-    
-    await message.answer(response, parse_mode="HTML")
-    await state.set_state(UploadStates.waiting_token)
-
-
-@dp.message(UploadStates.waiting_token, F.text)
-async def handle_token(message: types.Message, state: FSMContext):
-    """Принимаем токен или 'none' если токен не нужен"""
-    token = message.text.strip()
-    
-    # Если пользователь пишет "none" или "нет" — токен не нужен
-    if token.lower() in ["none", "нет", "no", "-", "skip", "пропустить"]:
-        token = ""
-        token_status = "🚫 Токен не требуется"
-    elif ":" not in token or len(token) < 30:
-        # Мягкая проверка токена
-        return await message.answer(
-            "⚠️ Похоже это не токен бота.\n\n"
-            "Формат: <code>1234567890:ABCdefGHIjklMNOpqrsTUVwxyz</code>\n\n"
-            "Если токен не нужен — отправь <code>none</code>",
-            parse_mode="HTML"
-        )
-    else:
-        token_status = "🔐 Токен принят"
-    
-    # Удаляем сообщение с токеном (безопасность)
-    try:
-        await message.delete()
-    except: pass
-    
-    data = await state.get_data()
-    bot_id = save_bot(message.from_user.id, data['filename'], token)
-    
-    bot_dir = BOTS_DIR / f"bot_{bot_id}"
-    bot_dir.mkdir(exist_ok=True)
-    
-    # Сохраняем код как user_bot.py
-    filename = data['filename']
-    if not filename.endswith(".py"):
-        filename = "user_bot.py"
-    (bot_dir / "user_bot.py").write_text(data['code'], encoding="utf-8")
-    
-    await message.answer(
-        f"✅ <b>Код сохранён!</b>\n\n"
-        f"🆔 ID: <code>{bot_id}</code>\n"
-        f"📁 Файл: {data['filename']}\n"
-        f"{token_status}\n\n"
-        f"📦 Поддерживаемые библиотеки:\n"
-        f"• aiogram, telebot, pyrogram, telethon\n"
-        f"• python-telegram-bot, botogram\n"
-        f"• openai, anthropic, groq (AI)\n"
-        f"• requests, aiohttp, httpx (HTTP)\n"
-        f"• discord.py, twitchio (другие платформы)\n"
-        f"• asyncio, aiohttp, fastapi, flask\n"
-        f"• и любые другие из PyPI!\n\n"
-        f"Запусти через <b>«🤖 Мои боты»</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🤖 К моим ботам", callback_data="mybots")]
-        ]),
-        parse_mode="HTML"
-    )
-    await state.clear()
-
-
-# ═══════════════════════════════════════════════════════════════
-# 📸 ОБЩИЙ ОБРАБОТЧИК ФОТО (после FSM!)
-# ═══════════════════════════════════════════════════════════════
-
-@dp.message(F.photo)
-async def handle_random_photo(message: types.Message):
-    """Если пользователь просто кидает фото"""
-    await message.answer(
-        "📸 <b>Получил фото!</b>\n\n"
-        "Чтобы <b>загрузить своего бота</b>, нужен <b>.py-файл</b>.\n"
-        "Используй кнопку ниже:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
-            [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
-        ]),
-        parse_mode="HTML"
-    )
-
-
-# ═══════════════════════════════════════════════════════════════
-# 🔘 CALLBACK ХЕНДЛЕРЫ
+# ─── CALLBACK ХЕНДЛЕРЫ ────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "back_main")
 async def cb_back_main(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()  # Очищаем состояние
-    
+    await state.clear()
     if is_user_banned(call.from_user.id):
         return await call.answer("🚫 Вы заблокированы", show_alert=True)
-    
-    # Удаляем старое сообщение
     try:
         await call.message.delete()
-    except Exception as e:
-        logger.debug(f"Не удалось удалить сообщение: {e}")
-    
-    # Отправляем новое приветствие
+    except Exception:
+        pass
     await send_welcome(call.message)
 
 
-# ─── Покупка слота ────────────────────────────────────────
+# ─── Покупка ──────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "buy")
 async def cb_buy(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()  # Очищаем состояние
-    
-    if is_user_banned(call.from_user.id):
+    await state.clear()
+    uid = call.from_user.id
+
+    if is_user_banned(uid):
         return await call.answer("🚫 Вы заблокированы", show_alert=True)
-    
-    if call.from_user.id == OWNER_ID:
-        await call.message.edit_text(
-            "👑 <b>Ты — владелец!</b>\n\n"
-            "У тебя <b>бесплатный безлимит</b>.",
+
+    if uid == OWNER_ID:
+        return await call.message.edit_text(
+            "👑 Ты владелец — безлимит бесплатно!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
-                [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
-            ]),
-            parse_mode="HTML"
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
+            ])
         )
-        return
-    
-    if is_admin(call.from_user.id):
-        await call.message.edit_text(
-            "🛡 <b>Ты — админ!</b>\n\n"
-            "У тебя <b>бесплатный безлимит</b>.",
+
+    if is_admin(uid):
+        return await call.message.edit_text(
+            "🛡 Ты админ — безлимит бесплатно!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
-                [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
-            ]),
-            parse_mode="HTML"
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
+            ])
         )
-        return
-    
-    text = (
+
+    await call.message.edit_text(
         "💎 <b>Выбери тариф</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Оплата <b>подарком</b> владельцу.\n"
-        "После отправки — подтверди в боте.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━"
+        "Оплата подарком в Telegram Stars.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"📅 Неделя — {PLANS['week']['stars']}⭐",
+                callback_data="plan:week"
+            )],
+            [InlineKeyboardButton(
+                text=f"📅 2 недели — {PLANS['2weeks']['stars']}⭐",
+                callback_data="plan:2weeks"
+            )],
+            [InlineKeyboardButton(
+                text=f"🗓 Месяц — {PLANS['month']['stars']}⭐",
+                callback_data="plan:month"
+            )],
+            [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
+        ]),
+        parse_mode="HTML"
     )
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"📅 Неделя — {PLANS['week']['stars']}⭐", callback_data="plan:week")],
-        [InlineKeyboardButton(text=f"📅 2 недели — {PLANS['2weeks']['stars']}⭐", callback_data="plan:2weeks")],
-        [InlineKeyboardButton(text=f"🗓 Месяц — {PLANS['month']['stars']}⭐", callback_data="plan:month")],
-        [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
-    ])
-    
-    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("plan:"))
 async def cb_plan(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()  # Очищаем состояние
+    await state.clear()
     plan_id = call.data.split(":")[1]
     plan = PLANS[plan_id]
+    uid = call.from_user.id
+
+    # МГНОВЕННАЯ ПРОВЕРКА: есть ли уже подарок в очереди?
+    realtime_gift = check_realtime_gift(uid, plan["stars"])
+    db_gift = get_pending_gift_for_plan(uid, plan_id)
+
+    if realtime_gift or db_gift:
+        # Подарок уже есть — предлагаем мгновенно активировать
+        gift_value = realtime_gift["value"] if realtime_gift else db_gift[1]
+        await call.message.edit_text(
+            f"🎁 <b>Подарок уже получен!</b>\n\n"
+            f"💎 {gift_value}⭐ — достаточно для тарифа «{plan['name']}»\n\n"
+            f"Нажми чтобы активировать:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text=f"✅ Активировать «{plan['name']}»",
+                    callback_data=f"confirm:{plan_id}"
+                )],
+                [InlineKeyboardButton(text="« Другие тарифы", callback_data="buy")],
+            ]),
+            parse_mode="HTML"
+        )
+        return
+
     link = get_profile_link()
-    
-    text = (
+    await call.message.edit_text(
         f"{plan['emoji']} <b>Тариф: {plan['name']}</b>\n\n"
+        f"💎 Стоимость: {plan['stars']}⭐\n"
+        f"📅 Длительность: {plan['days']} дней\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💎 <b>Стоимость:</b> {plan['stars']}⭐\n"
-        f"📅 <b>Длительность:</b> {plan['days']} дней\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<b>🎁 Как оплатить:</b>\n\n"
-        f"1️⃣ Нажми <b>«🎁 Отправить подарок»</b>\n\n"
-        f"2️⃣ В профиле нажми <b>⋮ → 🎁 Подарить</b>\n\n"
-        f"3️⃣ Выбери подарок <b>от {plan['stars']}⭐</b>\n\n"
-        f"4️⃣ Отправь подарок\n\n"
-        f"5️⃣ Вернись и нажми <b>«✅ Я отправил подарок»</b>"
+        f"<b>Как оплатить:</b>\n\n"
+        f"1️⃣ Нажми <b>«🎁 Отправить подарок»</b>\n"
+        f"2️⃣ Выбери подарок от {plan['stars']}⭐\n"
+        f"3️⃣ Отправь владельцу\n"
+        f"4️⃣ Вернись → <b>«✅ Я отправил»</b>\n\n"
+        f"💡 После отправки тариф активируется автоматически!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 Отправить подарок", url=link)],
+            [InlineKeyboardButton(
+                text="✅ Я отправил подарок",
+                callback_data=f"confirm:{plan_id}"
+            )],
+            [InlineKeyboardButton(text="« Другие тарифы", callback_data="buy")],
+            [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
+        ]),
+        parse_mode="HTML",
+        disable_web_page_preview=True
     )
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎁 Отправить подарок", url=link)],
-        [InlineKeyboardButton(text="✅ Я отправил подарок", callback_data=f"confirm:{plan_id}")],
-        [InlineKeyboardButton(text="« Другие тарифы", callback_data="buy")],
-        [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
-    ])
-    
-    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
 
 
 @dp.callback_query(F.data.startswith("confirm:"))
 async def cb_confirm_payment(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()  # Очищаем состояние
+    await state.clear()
     plan_id = call.data.split(":")[1]
     plan = PLANS[plan_id]
-    user_id = call.from_user.id
-    
+    uid = call.from_user.id
+
     await call.answer("⏳ Проверяю...")
-    
-    gift = get_pending_gift_for_plan(user_id, plan_id)
-    
-    if not gift:
+
+    # Проверяем реалтайм очередь
+    realtime_gift = check_realtime_gift(uid, plan["stars"])
+
+    # Проверяем БД
+    db_gift = get_pending_gift_for_plan(uid, plan_id)
+
+    if realtime_gift:
+        # Мгновенное подтверждение из очереди памяти!
+        gift_id = realtime_gift["gift_id"]
+        gift_value = realtime_gift["value"]
+
+        # Сохраняем в БД если ещё нет
+        db_gift_check = get_pending_gift_for_plan(uid, plan_id)
+        if db_gift_check:
+            activate_gift(db_gift_check[0], plan_id)
+
+        # Очищаем из очереди памяти
+        if uid in gift_queue:
+            gift_queue[uid] = [
+                g for g in gift_queue[uid]
+                if g["gift_id"] != gift_id
+            ]
+
+        expires_at = create_slot(uid, plan_id, gift_id)
+        expires_str = expires_at.strftime("%d.%m.%Y")
+
         await call.message.edit_text(
-            "❌ <b>Подарок не найден!</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Мы не получили подарок <b>от {plan['stars']}⭐</b>.\n\n"
-            "<b>Что делать:</b>\n"
-            f"1️⃣ Убедись что отправил <b>от {plan['stars']}⭐</b>\n"
-            "2️⃣ Подожди 1-2 минуты\n"
-            "3️⃣ Попробуй ещё раз",
+            f"✅ <b>Оплата подтверждена!</b>\n\n"
+            f"🎁 Подарок: {gift_value}⭐\n"
+            f"{plan['emoji']} Тариф: <b>{plan['name']}</b>\n"
+            f"📅 До: <b>{expires_str}</b>\n\n"
+            f"🎉 Теперь загрузи своего бота!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Проверить ещё раз", callback_data=f"confirm:{plan_id}")],
-                [InlineKeyboardButton(text="🎁 Отправить подарок", url=get_profile_link())],
+                [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
+                [InlineKeyboardButton(text="📊 Мои слоты", callback_data="myslots")],
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
+            ]),
+            parse_mode="HTML"
+        )
+
+    elif db_gift:
+        # Нашли в БД
+        gift_db_id, gift_value, gift_uid = db_gift
+        activate_gift(gift_db_id, plan_id)
+        expires_at = create_slot(uid, plan_id, str(gift_uid))
+        expires_str = expires_at.strftime("%d.%m.%Y")
+
+        await call.message.edit_text(
+            f"✅ <b>Оплата подтверждена!</b>\n\n"
+            f"🎁 Подарок: {gift_value}⭐\n"
+            f"{plan['emoji']} Тариф: <b>{plan['name']}</b>\n"
+            f"📅 До: <b>{expires_str}</b>\n\n"
+            f"🎉 Теперь загрузи своего бота!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
+                [InlineKeyboardButton(text="📊 Мои слоты", callback_data="myslots")],
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
+            ]),
+            parse_mode="HTML"
+        )
+
+    else:
+        # Подарок не найден
+        await call.message.edit_text(
+            f"❌ <b>Подарок не найден!</b>\n\n"
+            f"Нужно: <b>от {plan['stars']}⭐</b>\n\n"
+            f"<b>Что делать:</b>\n"
+            f"1️⃣ Убедись что отправил подарок\n"
+            f"2️⃣ Подожди 1-2 минуты\n"
+            f"3️⃣ Нажми «Проверить снова»\n\n"
+            f"<i>Если проблема не решается — напиши владельцу</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🔄 Проверить снова",
+                    callback_data=f"confirm:{plan_id}"
+                )],
+                [InlineKeyboardButton(
+                    text="🎁 Отправить подарок",
+                    url=get_profile_link()
+                )],
                 [InlineKeyboardButton(text="« Другие тарифы", callback_data="buy")],
-                [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
             ]),
             parse_mode="HTML",
             disable_web_page_preview=True
         )
         return
-    
-    gift_id, gift_value, gift_uid = gift
-    activate_gift(gift_id, plan_id)
-    create_slot(user_id, plan_id, gift_uid)
-    
-    await call.message.edit_text(
-        f"✅ <b>Оплата прошла!</b>\n\n"
-        f"🎁 Подарок: <b>{gift_value}⭐</b>\n"
-        f"{plan['emoji']} Тариф: <b>{plan['name']}</b>\n"
-        f"📅 Длительность: <b>{plan['days']} дней</b>\n\n"
-        f"🎉 Теперь можешь загрузить бота!",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
-            [InlineKeyboardButton(text="📊 Мои слоты", callback_data="myslots")],
-            [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
-        ]),
-        parse_mode="HTML"
-    )
-    
+
+    # Уведомляем владельца
     try:
-        admin_msg = (
+        await bot.send_message(
+            OWNER_ID,
             f"💰 <b>Оплата!</b>\n\n"
-            f"👤 @{call.from_user.username or '—'} (<code>{user_id}</code>)\n"
-            f"🎁 {gift_value}⭐ → {plan['name']}"
+            f"👤 @{call.from_user.username or '—'} "
+            f"(<code>{uid}</code>)\n"
+            f"💎 {plan['stars']}⭐ → {plan['name']}",
+            parse_mode="HTML"
         )
-        await bot.send_message(OWNER_ID, admin_msg, parse_mode="HTML")
-    except: pass
+    except Exception:
+        pass
 
 
-# ─── Загрузка ─────────────────────────────────────────────
+# ─── Загрузка ─────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "upload")
 async def cb_upload(call: types.CallbackQuery, state: FSMContext):
-    # НЕ очищаем состояние здесь — мы сами его устанавливаем
-    
-    if is_user_banned(call.from_user.id):
+    uid = call.from_user.id
+
+    if is_user_banned(uid):
         await state.clear()
         return await call.answer("🚫 Вы заблокированы", show_alert=True)
-    
-    if not has_active_slot(call.from_user.id):
+
+    if not has_active_slot(uid):
         await state.clear()
-        await call.answer("❌ Нет активного слота!", show_alert=True)
-        return
-    
+        return await call.answer("❌ Нет активного слота!", show_alert=True)
+
+    bots_count = get_user_bots_count(uid)
+    max_bots = MAX_BOTS_PER_USER if not is_admin(uid) else 100
+
     await call.message.edit_text(
-        "📤 <b>Загрузка кода</b>\n\n"
-        "Отправь <b>.py-файл</b> — подойдёт ЛЮБОЙ Python код!\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "✅ <b>Что можно загрузить:</b>\n"
-        "• Telegram-боты (aiogram, telebot, pyrogram)\n"
-        "• Discord-боты (discord.py)\n"
-        "• AI-скрипты (OpenAI, Groq, Anthropic)\n"
-        "• Веб-серверы (FastAPI, Flask)\n"
-        "• Парсеры, скрипты, утилиты\n"
-        "• ЛЮБОЙ Python-код!\n\n"
-        "📦 <b>Библиотеки:</b> aiogram, telebot, pyrogram, "
-        "python-telegram-bot, openai, requests, aiohttp, "
-        "fastapi, discord.py, numpy, pandas и 50+ других\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "💡 Токен можно не указывать — напиши <code>none</code>\n"
-        "📏 Макс. размер: 500 КБ",
+        f"📤 <b>Загрузка бота</b>\n\n"
+        f"👤 Твоих ботов: {bots_count} / {max_bots}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>Что загружать:</b>\n"
+        f"• <b>.py файл</b> — один скрипт (до 10 МБ)\n"
+        f"• <b>.zip архив</b> — несколько файлов (до 50 МБ)\n\n"
+        f"<b>Поддерживаются:</b>\n"
+        f"• aiogram, telebot, pyrogram, telethon\n"
+        f"• openai, groq, anthropic (AI)\n"
+        f"• discord.py, twitchio\n"
+        f"• requests, aiohttp, fastapi, flask\n"
+        f"• numpy, pandas, PIL и 100+ других\n\n"
+        f"💡 Для zip: укажи главный файл (main.py)\n"
+        f"💡 Токен: из BOT_TOKEN или os.environ['BOT_TOKEN']\n\n"
+        f"📤 <b>Отправляй файл!</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="« Отмена", callback_data="back_main")]
         ]),
@@ -1628,36 +2112,46 @@ async def cb_upload(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(UploadStates.waiting_file)
 
 
-# ─── Мои боты ─────────────────────────────────────────────
+# ─── Мои боты ─────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "mybots")
 async def cb_mybots(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()  # Очищаем состояние
+    await state.clear()
     bots = get_user_bots(call.from_user.id)
+
     if not bots:
-        await call.message.edit_text(
-            "🤖 <b>У тебя пока нет ботов</b>\n\n"
-            "Загрузи первого!",
+        return await call.message.edit_text(
+            "🤖 <b>У тебя пока нет ботов</b>\n\nЗагрузи первого!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
-                [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
             ]),
             parse_mode="HTML"
         )
-        return
-    
+
     buttons = []
     for b in bots:
-        status = "🟢" if b[0] in running_bots else "🔴"
+        # b: id, user_id, name, main_file, bot_token, status, created_at, file_count, total_size
+        bid = b[0]
+        name = b[2] or f"bot_{bid}"
+        status_icon = "🟢" if bid in running_bots else "🔴"
+        file_count = b[7] or 1
+        files_str = f" [{file_count}ф]" if file_count > 1 else ""
         buttons.append([InlineKeyboardButton(
-            text=f"{status} #{b[0]} • {b[2]}",
-            callback_data=f"bot:{b[0]}"
+            text=f"{status_icon} #{bid} {name[:20]}{files_str}",
+            callback_data=f"bot:{bid}"
         )])
-    buttons.append([InlineKeyboardButton(text="« Главное меню", callback_data="back_main")])
-    
+
+    buttons.append([InlineKeyboardButton(
+        text="📤 Загрузить ещё", callback_data="upload"
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="« Меню", callback_data="back_main"
+    )])
+
     await call.message.edit_text(
         f"🤖 <b>Твои боты ({len(bots)})</b>\n\n"
-        "🟢 работает • 🔴 остановлен",
+        f"🟢 работает • 🔴 остановлен • [Nф] файлов",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML"
     )
@@ -1667,142 +2161,221 @@ async def cb_mybots(call: types.CallbackQuery, state: FSMContext):
 async def cb_bot_detail(call: types.CallbackQuery):
     bot_id = int(call.data.split(":")[1])
     b = get_bot(bot_id)
-    if not b or b[1] != call.from_user.id:
-        if not is_admin(call.from_user.id):
-            return await call.answer("❌ Нет доступа", show_alert=True)
-    
+    uid = call.from_user.id
+
+    if not b or (b[1] != uid and not is_admin(uid)):
+        return await call.answer("❌ Нет доступа", show_alert=True)
+
+    # b: id, user_id, name, main_file, bot_token, status, created_at, file_count, total_size
+    name = b[2] or f"bot_{bot_id}"
+    main_file = b[3] or "main.py"
     status = "🟢 Работает" if bot_id in running_bots else "🔴 Остановлен"
-    
+    file_count = b[7] or 1
+    total_size = b[8] or 0
+    size_str = (
+        f"{total_size // 1024} КБ"
+        if total_size < 1024 * 1024
+        else f"{total_size / 1024 / 1024:.1f} МБ"
+    )
+
     await call.message.edit_text(
         f"🤖 <b>Бот #{bot_id}</b>\n\n"
-        f"📁 Файл: <code>{b[2]}</code>\n"
+        f"📁 Название: <code>{name}</code>\n"
+        f"🐍 Главный файл: <code>{main_file}</code>\n"
+        f"📄 Файлов: {file_count}\n"
+        f"📏 Размер: {size_str}\n"
         f"📊 Статус: <b>{status}</b>\n"
-        f"📅 Создан: {b[5][:10]}",
+        f"📅 Создан: {b[6][:10]}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="▶️ Запустить", callback_data=f"start:{bot_id}"),
                 InlineKeyboardButton(text="⏹ Стоп", callback_data=f"stop:{bot_id}"),
             ],
             [InlineKeyboardButton(text="📄 Логи", callback_data=f"logs:{bot_id}")],
-            [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{bot_id}")],
+            [InlineKeyboardButton(text="📁 Файлы", callback_data=f"files:{bot_id}")],
+            [InlineKeyboardButton(text="➕ Добавить файл", callback_data=f"addfile:{bot_id}")],
+            [InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"del:{bot_id}")],
             [InlineKeyboardButton(text="« К списку", callback_data="mybots")],
         ]),
         parse_mode="HTML"
     )
 
 
-@dp.callback_query(F.data.startswith("start:"))
-async def cb_start_bot(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()  # Очищаем состояние
-    
+@dp.callback_query(F.data.startswith("files:"))
+async def cb_bot_files(call: types.CallbackQuery):
+    """Список файлов бота"""
     bot_id = int(call.data.split(":")[1])
     b = get_bot(bot_id)
-    if not b or b[1] != call.from_user.id:
+    uid = call.from_user.id
+
+    if not b or (b[1] != uid and not is_admin(uid)):
         return await call.answer("❌ Нет доступа", show_alert=True)
-    
-    if not has_active_slot(call.from_user.id):
+
+    files = list_bot_files(bot_id)
+    main_file = b[3] or "main.py"
+
+    if not files:
+        text = "📭 Файлов нет"
+    else:
+        text = f"📁 <b>Файлы бота #{bot_id}</b>\n\n"
+        for f in files[:20]:
+            size = f.stat().st_size
+            size_str = f"{size:,} б" if size < 1024 else f"{size // 1024} КБ"
+            is_main = "👑" if f.name == main_file else "📄"
+            text += f"{is_main} <code>{f.name}</code> — {size_str}\n"
+        if len(files) > 20:
+            text += f"\n... и ещё {len(files) - 20} файлов"
+
+    # Кнопки для смены главного файла
+    py_files = [f for f in files if f.name.endswith(".py")]
+    change_buttons = []
+    if len(py_files) > 1:
+        for f in py_files[:5]:
+            if f.name != main_file:
+                change_buttons.append([InlineKeyboardButton(
+                    text=f"👑 Сделать главным: {f.name}",
+                    callback_data=f"changemain:{bot_id}:{f.name}"
+                )])
+
+    await call.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            *change_buttons,
+            [InlineKeyboardButton(
+                text="➕ Добавить файл", callback_data=f"addfile:{bot_id}"
+            )],
+            [InlineKeyboardButton(
+                text="« К боту", callback_data=f"bot:{bot_id}"
+            )],
+        ]),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("changemain:"))
+async def cb_change_main(call: types.CallbackQuery):
+    """Смена главного файла"""
+    parts = call.data.split(":", 2)
+    bot_id = int(parts[1])
+    new_main = parts[2]
+    uid = call.from_user.id
+
+    b = get_bot(bot_id)
+    if not b or (b[1] != uid and not is_admin(uid)):
+        return await call.answer("❌ Нет доступа", show_alert=True)
+
+    update_bot_main_file(bot_id, new_main)
+    await call.answer(f"✅ Главный файл: {new_main}")
+    await cb_bot_files(call)
+
+
+@dp.callback_query(F.data.startswith("addfile:"))
+async def cb_add_file(call: types.CallbackQuery, state: FSMContext):
+    """Добавить файл к боту"""
+    bot_id = int(call.data.split(":")[1])
+    b = get_bot(bot_id)
+    uid = call.from_user.id
+
+    if not b or (b[1] != uid and not is_admin(uid)):
+        return await call.answer("❌ Нет доступа", show_alert=True)
+
+    await call.message.edit_text(
+        f"➕ <b>Добавить файл к боту #{bot_id}</b>\n\n"
+        f"Отправь файл (.py, .json, .txt, .yaml, .cfg)\n"
+        f"Максимум: {MAX_FILE_SIZE // 1024 // 1024} МБ\n\n"
+        f"Отмена: /cancel",
+        parse_mode="HTML"
+    )
+    await state.update_data(bot_id=bot_id)
+    await state.set_state(UploadStates.add_file)
+
+
+@dp.callback_query(F.data.startswith("start:"))
+async def cb_start_bot(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    bot_id = int(call.data.split(":")[1])
+    b = get_bot(bot_id)
+    uid = call.from_user.id
+
+    if not b or (b[1] != uid and not is_admin(uid)):
+        return await call.answer("❌ Нет доступа", show_alert=True)
+
+    if not has_active_slot(uid):
         return await call.answer("❌ Нет активного слота", show_alert=True)
-    
+
     if bot_id in running_bots:
         return await call.answer("⚠️ Уже запущен", show_alert=True)
-    
-    await call.answer("⏳ Запускаю (это займёт ~5 секунд)...")
-    
-    code_file = BOTS_DIR / f"bot_{bot_id}" / "user_bot.py"
+
+    await call.answer("⏳ Запускаю (~7 сек)...")
+
+    main_file = b[3] or "main.py"
+    user_bot_token = b[4] or ""
+
+    code_file = get_bot_dir(bot_id) / main_file
     if not code_file.exists():
-        return await call.answer("❌ Файл не найден", show_alert=True)
-    
-    code = code_file.read_text(encoding="utf-8")
-    # b[3] — это токен (может быть пустой строкой)
-    user_bot_token = b[3] if b[3] else ""
-    success = await start_user_bot(bot_id, code, user_bot_token)
-    
+        # Пробуем найти любой .py файл
+        py_files = list(get_bot_dir(bot_id).glob("*.py"))
+        py_files = [f for f in py_files if f.name != "wrapper.py"]
+        if py_files:
+            main_file = py_files[0].name
+            update_bot_main_file(bot_id, main_file)
+        else:
+            return await call.answer("❌ Файл не найден", show_alert=True)
+
+    success = await start_user_bot(bot_id, user_bot_token, main_file)
+
     if success:
         await call.message.answer(
             f"✅ <b>Бот #{bot_id} запущен!</b>\n\n"
-            f"🟢 Статус: работает\n"
-            f"⏱ Мониторинг активен",
-            parse_mode="HTML"
-        )
-    else:
-        # Бот упал — показываем подробную ошибку
-        logs = get_bot_logs(bot_id, 40)
-        
-        # Определяем типичные проблемы и даём подсказки
-        error_hint = ""
-        
-        if "Conflict" in logs or "getUpdates" in logs or "terminated by other" in logs:
-            error_hint = (
-                "\n\n🔴 <b>КОНФЛИКТ!</b>\n"
-                "Этот токен уже используется в другом боте.\n"
-                "Убедись что:\n"
-                "• Ты не запускаешь этот же бот где-то ещё\n"
-                "• Нет других инстансов с этим токеном\n"
-                "• Попробуй получить новый токен у @BotFather"
-            )
-        elif "Unauthorized" in logs or "Invalid token" in logs or "401" in logs:
-            error_hint = (
-                "\n\n🔴 <b>НЕВЕРНЫЙ ТОКЕН!</b>\n"
-                "Токен бота недействителен.\n"
-                "Удали бота и загрузи заново с правильным токеном."
-            )
-        elif "GROQ_API_KEY" in logs:
-            error_hint = (
-                "\n\n💡 <b>Подсказка:</b> Добавь <code>GROQ_API_KEY</code> в Railway:\n"
-                "Railway → твой проект → Variables → + New Variable"
-            )
-        elif "OPENAI_API_KEY" in logs:
-            error_hint = (
-                "\n\n💡 <b>Подсказка:</b> Добавь <code>OPENAI_API_KEY</code> в Railway Variables"
-            )
-        elif "No module named" in logs:
-            # Извлекаем имя модуля
-            import re
-            module_match = re.search(r"No module named '([^']+)'", logs)
-            module_name = module_match.group(1) if module_match else "библиотеку"
-            error_hint = (
-                f"\n\n💡 <b>Не хватает библиотеки:</b> <code>{module_name}</code>\n"
-                "Напиши владельцу чтобы добавил её в requirements.txt"
-            )
-        elif "SyntaxError" in logs or "IndentationError" in logs:
-            error_hint = "\n\n💡 <b>Подсказка:</b> Синтаксическая ошибка в коде. Проверь отступы и скобки."
-        elif "NameError" in logs:
-            error_hint = "\n\n💡 <b>Подсказка:</b> Переменная не определена. Проверь код."
-        elif "ConnectionError" in logs or "Timeout" in logs:
-            error_hint = "\n\n💡 <b>Подсказка:</b> Ошибка сети. Попробуй ещё раз через минуту."
-        elif "BOT_TOKEN не установлен" in logs:
-            error_hint = (
-                "\n\n💡 <b>Подсказка:</b> Используй <code>os.environ.get('BOT_TOKEN')</code>\n"
-                "НЕ хардкодь токен в коде!"
-            )
-        elif "ImportError" in logs:
-            error_hint = "\n\n💡 <b>Подсказка:</b> Ошибка импорта. Проверь названия библиотек."
-        
-        # Формируем текст — ВАЖНО: экранируем HTML символы в логах!
-        if not logs.strip():
-            logs_text = "📭 Логи пустые (бот упал очень быстро)"
-        else:
-            # Экранируем < > & чтобы Telegram не парсил их как HTML теги
-            logs_text = html.escape(logs[:2000])
-        
-        # Также экранируем подсказку на всякий случай
-        error_hint_safe = error_hint  # уже содержит HTML разметку, не экранируем
-        
-        await call.message.answer(
-            f"❌ <b>Бот #{bot_id} не запустился</b>\n\n"
-            f"<b>📋 Логи:</b>\n"
-            f"<pre>{logs_text}</pre>"
-            f"{error_hint_safe}\n\n"
-            f"🔧 <b>Что делать:</b>\n"
-            f"1. Проверь ошибку выше\n"
-            f"2. Исправь код или настройки\n"
-            f"3. Нажми «Попробовать снова»",
+            f"🐍 Файл: <code>{main_file}</code>\n"
+            f"🟢 Мониторинг активен",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"start:{bot_id}")],
-                [InlineKeyboardButton(text="📄 Полные логи", callback_data=f"logs:{bot_id}")],
-                [InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"del:{bot_id}")],
-                [InlineKeyboardButton(text="« К списку", callback_data="mybots")],
+                [InlineKeyboardButton(text="📄 Логи", callback_data=f"logs:{bot_id}")],
+                [InlineKeyboardButton(text="⏹ Стоп", callback_data=f"stop:{bot_id}")],
+                [InlineKeyboardButton(text="« К боту", callback_data=f"bot:{bot_id}")],
+            ])
+        )
+    else:
+        logs = get_bot_logs(bot_id, 40)
+
+        # Анализируем ошибку
+        hint = ""
+        if "Conflict" in logs or "getUpdates" in logs:
+            hint = "\n🔴 <b>КОНФЛИКТ:</b> Токен уже используется в другом месте"
+        elif "Unauthorized" in logs or "401" in logs:
+            hint = "\n🔴 <b>НЕВЕРНЫЙ ТОКЕН:</b> Проверь токен у @BotFather"
+        elif "No module named" in logs:
+            m = re.search(r"No module named '([^']+)'", logs)
+            mod = m.group(1) if m else "библиотеку"
+            hint = f"\n💡 <b>Нет библиотеки:</b> <code>{mod}</code>"
+        elif "SyntaxError" in logs or "IndentationError" in logs:
+            hint = "\n💡 <b>Синтаксическая ошибка</b> в коде"
+        elif "BOT_TOKEN" in logs and "not set" in logs.lower():
+            hint = "\n💡 <b>Нет токена:</b> Удали и загрузи с токеном"
+        elif "ConnectionError" in logs:
+            hint = "\n💡 <b>Сеть:</b> Попробуй позже"
+
+        logs_safe = html.escape(logs[:2000])
+
+        await call.message.answer(
+            f"❌ <b>Бот #{bot_id} не запустился</b>\n"
+            f"{hint}\n\n"
+            f"<b>📋 Логи:</b>\n<pre>{logs_safe}</pre>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🔄 Попробовать снова",
+                    callback_data=f"start:{bot_id}"
+                )],
+                [InlineKeyboardButton(
+                    text="📄 Полные логи",
+                    callback_data=f"logs:{bot_id}"
+                )],
+                [InlineKeyboardButton(
+                    text="« К боту",
+                    callback_data=f"bot:{bot_id}"
+                )],
             ])
         )
 
@@ -1811,11 +2384,14 @@ async def cb_start_bot(call: types.CallbackQuery, state: FSMContext):
 async def cb_stop_bot(call: types.CallbackQuery):
     bot_id = int(call.data.split(":")[1])
     b = get_bot(bot_id)
-    if not b or b[1] != call.from_user.id:
+    uid = call.from_user.id
+
+    if not b or (b[1] != uid and not is_admin(uid)):
         return await call.answer("❌ Нет доступа", show_alert=True)
-    
+
     await stop_user_bot(bot_id)
     await call.answer("⏹ Остановлен")
+    await cb_bot_detail(call)
 
 
 @dp.callback_query(F.data.startswith("logs:"))
@@ -1823,13 +2399,14 @@ async def cb_logs(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     bot_id = int(call.data.split(":")[1])
     b = get_bot(bot_id)
-    if not b or (b[1] != call.from_user.id and not is_admin(call.from_user.id)):
+    uid = call.from_user.id
+
+    if not b or (b[1] != uid and not is_admin(uid)):
         return await call.answer("❌ Нет доступа", show_alert=True)
-    
-    logs = get_bot_logs(bot_id, 50)
-    # Экранируем HTML символы чтобы Telegram не парсил <module> и подобное
-    logs_safe = html.escape(logs[:3000])
-    
+
+    logs = get_bot_logs(bot_id, 60)
+    logs_safe = html.escape(logs[:3500])
+
     await call.message.answer(
         f"📄 <b>Логи бота #{bot_id}</b>\n\n<pre>{logs_safe}</pre>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1844,101 +2421,109 @@ async def cb_logs(call: types.CallbackQuery, state: FSMContext):
 async def cb_delete_bot(call: types.CallbackQuery):
     bot_id = int(call.data.split(":")[1])
     b = get_bot(bot_id)
-    if not b or b[1] != call.from_user.id:
+    uid = call.from_user.id
+
+    if not b or (b[1] != uid and not is_admin(uid)):
         return await call.answer("❌ Нет доступа", show_alert=True)
-    
+
     await stop_user_bot(bot_id)
+
+    # Удаляем файлы
+    bot_dir = get_bot_dir(bot_id)
+    try:
+        shutil.rmtree(bot_dir)
+    except Exception as e:
+        logger.error(f"Ошибка удаления директории #{bot_id}: {e}")
+
     delete_bot_record(bot_id)
     await call.answer("🗑 Удалён")
     await cb_mybots(call)
 
 
-# ─── Мои слоты ────────────────────────────────────────────
+# ─── Мои слоты ────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "myslots")
 async def cb_myslots(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()  # Очищаем состояние
-    if call.from_user.id == OWNER_ID:
-        await call.message.edit_text(
-            "👑 <b>Твой слот:</b>\n\n"
-            "🎫 <b>Безлимитный</b> (бесплатно)\n"
-            "♾ Действует: всегда",
+    await state.clear()
+    uid = call.from_user.id
+
+    if uid == OWNER_ID:
+        return await call.message.edit_text(
+            "👑 <b>Твой слот: Безлимитный (владелец)</b>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")]
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
             ]),
             parse_mode="HTML"
         )
-        return
-    
-    if is_admin(call.from_user.id):
-        await call.message.edit_text(
-            "🛡 <b>Твой слот:</b>\n\n"
-            "🎫 <b>Безлимитный</b> (админ)\n"
-            "♾ Действует: всегда",
+
+    if is_admin(uid):
+        return await call.message.edit_text(
+            "🛡 <b>Твой слот: Безлимитный (админ)</b>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")]
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
             ]),
             parse_mode="HTML"
         )
-        return
-    
-    slots = get_active_slots(call.from_user.id)
+
+    slots = get_active_slots(uid)
     if not slots:
-        await call.message.edit_text(
-            "💳 <b>У тебя нет активных слотов</b>\n\n"
-            "Купи через подарок!",
+        return await call.message.edit_text(
+            "💳 <b>Нет активных слотов</b>\n\nКупи через подарок!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="💎 Купить слот", callback_data="buy")],
-                [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
+                [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
             ]),
             parse_mode="HTML"
         )
-        return
-    
-    text = f"💳 <b>Твои активные слоты ({len(slots)})</b>\n\n"
+
+    text = f"💳 <b>Активные слоты ({len(slots)})</b>\n\n"
     for s in slots:
         exp = datetime.fromisoformat(s[3])
         days_left = (exp - datetime.now()).days
-        text += f"• <b>{PLANS[s[2]]['name']}</b> — ещё {days_left} дн. (до {exp.strftime('%d.%m')})\n"
-    
+        plan_name = PLANS.get(s[2], {}).get("name", s[2])
+        text += (
+            f"• <b>{plan_name}</b> — "
+            f"ещё {days_left} дн. (до {exp.strftime('%d.%m.%Y')})\n"
+        )
+
     await call.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💎 Купить ещё", callback_data="buy")],
-            [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
+            [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
         ]),
         parse_mode="HTML"
     )
 
 
-# ─── Помощь ───────────────────────────────────────────────
+# ─── Помощь ───────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "help")
 async def cb_help(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()  # Очищаем состояние
-    link = get_profile_link()
-    text = (
+    await state.clear()
+    await call.message.edit_text(
         "❓ <b>Помощь</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>🎁 Как купить слот?</b>\n"
-        "1. Нажми «💎 Купить слот»\n"
-        "2. Выбери тариф (15/25/50⭐)\n"
-        "3. Нажми «🎁 Отправить подарок»\n"
-        "4. Отправь подарок владельцу\n"
-        "5. Вернись и нажми «✅ Я отправил подарок»\n\n"
-        "<b>📤 Как загрузить бота?</b>\n"
+        "<b>💎 Покупка слота:</b>\n"
+        "1. «Купить слот» → выбери тариф\n"
+        "2. Отправь подарок владельцу\n"
+        "3. Тариф активируется автоматически!\n\n"
+        "<b>📤 Загрузка бота:</b>\n"
         "1. Купи слот\n"
-        "2. Нажми «📤 Загрузить бота»\n"
-        "3. Отправь .py-файл\n"
-        "4. Отправь токен бота\n"
-        "5. Запусти через «🤖 Мои боты»\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    await call.message.edit_text(
-        text,
+        "2. «Загрузить бота» → .py или .zip\n"
+        "3. Укажи главный файл (для zip)\n"
+        "4. Отправь токен или none\n"
+        "5. Запусти через «Мои боты»\n\n"
+        "<b>📦 Форматы:</b>\n"
+        "• .py — один файл (до 10 МБ)\n"
+        "• .zip — несколько файлов (до 50 МБ)\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👤 Написать владельцу", url=link)],
-            [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
+            [InlineKeyboardButton(
+                text="👤 Написать владельцу",
+                url=get_profile_link()
+            )],
+            [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
         ]),
         parse_mode="HTML",
         disable_web_page_preview=True
@@ -1949,7 +2534,7 @@ async def cb_help(call: types.CallbackQuery, state: FSMContext):
 # 🔐 АДМИН-ПАНЕЛЬ
 # ═══════════════════════════════════════════════════════════════
 
-async def show_admin_panel(message: types.Message, edit: bool = False):
+async def show_admin_panel(target, edit: bool = False):
     stats = get_stats()
     text = (
         "🔐 <b>Админ-панель</b>\n\n"
@@ -1958,8 +2543,11 @@ async def show_admin_panel(message: types.Message, edit: bool = False):
         f"🚫 Заблок.: <b>{stats['banned']}</b>\n"
         f"🛡 Админов: <b>{stats['admins']}</b>\n"
         f"💳 Слотов: <b>{stats['active_slots']}</b>\n"
-        f"🤖 Ботов: <b>{stats['total_bots']}</b> (🟢 {stats['running_bots']})\n"
-        f"🎁 Подарков: <b>{stats['total_gifts']}</b> ({stats['total_stars']}⭐)\n\n"
+        f"🤖 Ботов: <b>{stats['total_bots']}</b> "
+        f"(🟢 {stats['running_bots']})\n"
+        f"🎁 Подарков: <b>{stats['total_gifts']}</b> "
+        f"({stats['total_stars']}⭐)\n"
+        f"📡 Userbot: <b>{stats['userbot_status']}</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1975,19 +2563,20 @@ async def show_admin_panel(message: types.Message, edit: bool = False):
             InlineKeyboardButton(text="❌ -Админ", callback_data="adm:remadmin"),
         ],
         [InlineKeyboardButton(text="🖼 Приветствие", callback_data="adm:welcome")],
+        [InlineKeyboardButton(text="🎁 Добавить подарок", callback_data="adm:gift")],
         [InlineKeyboardButton(text="🔄 Рестарт всех", callback_data="adm:restart")],
-        [InlineKeyboardButton(text="« Главное меню", callback_data="back_main")],
+        [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
     ])
-    
+
     if edit:
-        await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
     else:
-        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "admin")
 async def cb_admin(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()  # Очищаем состояние
+    await state.clear()
     if not is_admin(call.from_user.id):
         return await call.answer("🔐 Нет прав", show_alert=True)
     await show_admin_panel(call.message, edit=True)
@@ -1995,10 +2584,11 @@ async def cb_admin(call: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "adm:stats")
 async def cb_adm_stats(call: types.CallbackQuery):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        return
     s = get_stats()
-    text = (
-        "📊 <b>Подробная статистика</b>\n\n"
+    await call.message.edit_text(
+        f"📊 <b>Статистика</b>\n\n"
         f"👥 Пользователей: {s['total_users']}\n"
         f"🚫 Заблок.: {s['banned']}\n"
         f"🛡 Админов: {s['admins']}\n\n"
@@ -2006,10 +2596,8 @@ async def cb_adm_stats(call: types.CallbackQuery):
         f"🤖 Ботов всего: {s['total_bots']}\n"
         f"🤖 Работает: {s['running_bots']}\n\n"
         f"🎁 Подарков: {s['total_gifts']}\n"
-        f"💎 Звёзд: {s['total_stars']}⭐"
-    )
-    await call.message.edit_text(
-        text,
+        f"💎 Звёзд: {s['total_stars']}⭐\n\n"
+        f"📡 Userbot: {s['userbot_status']}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="« Админка", callback_data="admin")]
         ]),
@@ -2019,11 +2607,11 @@ async def cb_adm_stats(call: types.CallbackQuery):
 
 @dp.callback_query(F.data == "adm:broadcast")
 async def cb_adm_broadcast(call: types.CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        return
     await call.message.edit_text(
         "📢 <b>Рассылка</b>\n\n"
-        "Отправь сообщение.\n"
-        "⚠️ Отправится как <b>обычный текст</b> (без HTML).\n\n"
+        "Отправь сообщение (обычный текст).\n"
         "Отмена: /cancel"
     )
     await state.set_state(AdminStates.broadcast)
@@ -2031,18 +2619,19 @@ async def cb_adm_broadcast(call: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "adm:users")
 async def cb_adm_users(call: types.CallbackQuery):
-    if not is_admin(call.from_user.id): return
-    users = get_all_users()[:15]
-    if not users:
-        text = "👥 Пользователей нет"
-    else:
-        text = f"👥 <b>Пользователи ({len(get_all_users())})</b>\n\n"
-        for u in users:
-            ban = "🚫" if u[4] else "✓"
-            adm = "🛡" if u[3] else ""
-            uname = f"@{u[1]}" if u[1] else "—"
-            text += f"{ban}{adm} <code>{u[0]}</code> {uname}\n"
-    
+    if not is_admin(call.from_user.id):
+        return
+    users = get_all_users()
+    text = f"👥 <b>Пользователи ({len(users)})</b>\n\n"
+    for u in users[:20]:
+        # u: user_id, username, full_name, is_admin, is_banned, created_at
+        ban = "🚫" if u[4] else "✓"
+        adm = "🛡" if u[3] else ""
+        uname = f"@{u[1]}" if u[1] else (u[2] or "—")
+        text += f"{ban}{adm} <code>{u[0]}</code> {html.escape(str(uname))}\n"
+    if len(users) > 20:
+        text += f"\n...и ещё {len(users) - 20}"
+
     await call.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2054,11 +2643,11 @@ async def cb_adm_users(call: types.CallbackQuery):
 
 @dp.callback_query(F.data == "adm:ban")
 async def cb_adm_ban(call: types.CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        return
     await call.message.edit_text(
         "🚫 <b>Блокировка</b>\n\n"
         "Отправь ID или @username.\n"
-        "Пример: <code>123456789</code> или <code>@user</code>\n\n"
         "Отмена: /cancel",
         parse_mode="HTML"
     )
@@ -2067,10 +2656,11 @@ async def cb_adm_ban(call: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "adm:unban")
 async def cb_adm_unban(call: types.CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        return
     await call.message.edit_text(
         "✅ <b>Разблокировка</b>\n\n"
-        "Отправь ID пользователя.\n\n"
+        "Отправь ID пользователя.\n"
         "Отмена: /cancel"
     )
     await state.set_state(AdminStates.unban)
@@ -2082,7 +2672,7 @@ async def cb_addadmin(call: types.CallbackQuery, state: FSMContext):
         return await call.answer("⚠️ Только владелец", show_alert=True)
     await call.message.edit_text(
         "🛡 <b>Добавить админа</b>\n\n"
-        "Отправь ID или @username.\n\n"
+        "Отправь ID или @username.\n"
         "Отмена: /cancel"
     )
     await state.set_state(AdminStates.addadmin)
@@ -2092,26 +2682,27 @@ async def cb_addadmin(call: types.CallbackQuery, state: FSMContext):
 async def cb_remadmin(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return await call.answer("⚠️ Только владелец", show_alert=True)
-    
     admins = get_all_admins()
     if not admins:
-        return await call.answer("📭 Админов нет", show_alert=True)
-    
+        return await call.answer("📭 Нет админов", show_alert=True)
+
     buttons = [[InlineKeyboardButton(
         text=f"❌ {a[1] or a[2] or a[0]}",
         callback_data=f"remadm:{a[0]}"
     )] for a in admins]
     buttons.append([InlineKeyboardButton(text="« Отмена", callback_data="admin")])
-    
+
     await call.message.edit_text(
         "❌ <b>Удалить админа:</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
     )
 
 
 @dp.callback_query(F.data.startswith("remadm:"))
 async def cb_remadm_confirm(call: types.CallbackQuery):
-    if call.from_user.id != OWNER_ID: return
+    if call.from_user.id != OWNER_ID:
+        return
     uid = int(call.data.split(":")[1])
     remove_admin(uid)
     await call.answer("✅ Удалён")
@@ -2122,12 +2713,11 @@ async def cb_remadm_confirm(call: types.CallbackQuery):
 async def cb_welcome(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != OWNER_ID:
         return await call.answer("⚠️ Только владелец", show_alert=True)
-    
     status = "✅ Установлена" if WELCOME_IMAGE.exists() else "📭 Не установлена"
     await call.message.edit_text(
-        f"🖼 <b>Приветствие</b>\n\n"
-        f"Картинка: {status}\n\n"
-        f"Отправь <b>фото</b> или напиши <code>delete</code>.\n"
+        f"🖼 <b>Картинка приветствия</b>\n\n"
+        f"Статус: {status}\n\n"
+        f"Отправь фото или напиши <code>delete</code>.\n"
         f"Отмена: /cancel",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="« Админка", callback_data="admin")]
@@ -2137,31 +2727,53 @@ async def cb_welcome(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.welcome_photo)
 
 
+@dp.callback_query(F.data == "adm:gift")
+async def cb_adm_gift(call: types.CallbackQuery, state: FSMContext):
+    """Ручное добавление подарка (для тестирования/ручного подтверждения)"""
+    if call.from_user.id != OWNER_ID:
+        return await call.answer("⚠️ Только владелец", show_alert=True)
+    await call.message.edit_text(
+        "🎁 <b>Добавить подарок вручную</b>\n\n"
+        "Формат: <code>user_id звёзды</code>\n"
+        "Пример: <code>123456789 50</code>\n\n"
+        "Используй для ручного подтверждения оплаты.\n"
+        "Отмена: /cancel",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminStates.manual_gift)
+
+
 @dp.callback_query(F.data == "adm:restart")
 async def cb_restart_all(call: types.CallbackQuery):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        return
     await call.answer("⏳ Перезапускаю...")
-    
+
+    # Останавливаем всех
     for bid in list(running_bots.keys()):
         await stop_user_bot(bid)
-    
-    all_bots = get_all_bots()
+
+    # Запускаем снова
     restarted = 0
-    for b in all_bots:
-        bid, uid, _, user_bot_token, status, _ = b
+    for b in get_all_bots():
+        # b: id, user_id, name, main_file, bot_token, status, created_at, ...
+        bid = b[0]
+        uid = b[1]
+        user_bot_token = b[4] or ""
+        main_file = b[3] or "main.py"
+
         if is_user_banned(uid):
             continue
         if uid != OWNER_ID and not is_admin(uid) and not has_active_slot(uid):
             continue
-        
-        code_file = BOTS_DIR / f"bot_{bid}" / "user_bot.py"
+
+        code_file = get_bot_dir(bid) / main_file
         if code_file.exists():
-            code = code_file.read_text(encoding="utf-8")
-            if await start_user_bot(bid, code, user_bot_token):
+            if await start_user_bot(bid, user_bot_token, main_file):
                 restarted += 1
-    
+
     await call.message.answer(
-        f"🔄 <b>Перезапущено:</b> {restarted}",
+        f"🔄 <b>Перезапущено: {restarted}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="« Админка", callback_data="admin")]
         ]),
@@ -2175,18 +2787,36 @@ async def cb_restart_all(call: types.CallbackQuery):
 
 async def main():
     init_db()
-    logger.info("=" * 50)
-    logger.info("🤖 BotHost запущен")
+
+    logger.info("=" * 55)
+    logger.info("🤖 BotHost v2.0 запускается")
     logger.info(f"👤 Владелец: {OWNER_ID}")
-    logger.info("=" * 50)
-    
-    # Восстанавливаем запущенных ботов
+    logger.info(f"📦 Макс. файл: {MAX_FILE_SIZE // 1024 // 1024} МБ")
+    logger.info(f"📦 Макс. zip: {MAX_ZIP_SIZE // 1024 // 1024} МБ")
+    logger.info(f"🤖 Макс. ботов/юзер: {MAX_BOTS_PER_USER}")
+    logger.info(
+        f"📡 Userbot: "
+        f"{'настроен' if all([OWNER_PHONE, OWNER_API_ID, OWNER_API_HASH]) else 'НЕ настроен'}"
+    )
+    logger.info("=" * 55)
+
+    # Восстанавливаем ботов
     await restore_running_bots()
-    
+
     # Фоновые задачи
-    asyncio.create_task(check_gifts())
     asyncio.create_task(monitor_bots())
-    
+
+    # Userbot для подарков (если настроен)
+    if all([OWNER_PHONE, OWNER_API_ID, OWNER_API_HASH]):
+        asyncio.create_task(start_userbot())
+    else:
+        logger.warning(
+            "⚠️ Userbot не запущен.\n"
+            "   Установи OWNER_PHONE, OWNER_API_ID, OWNER_API_HASH\n"
+            "   для автоматического отслеживания подарков"
+        )
+
+    logger.info("✅ Polling запущен")
     await dp.start_polling(bot)
 
 
