@@ -32,7 +32,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # 🔧 КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════════════
 
-BOT_TOKEN      = os.environ["8711311188:AAHnhjvLhyYASMxUI-1hLyktHXhSsmYXnww"]
+BOT_TOKEN      = "8711311188:AAHnhjvLhyYASMxUI-1hLyktHXhSsmYXnww"
 OWNER_ID       = int(os.environ["8269807543"])
 OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "")
 OWNER_PHONE    = os.environ.get("OWNER_PHONE", "")
