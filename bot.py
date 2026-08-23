@@ -1,11 +1,3 @@
-"""
-🤖 BotHost v3.2 — StringSession + ручное подтверждение оплаты
-✅ Userbot через готовую StringSession (без кодов)
-✅ Ручное подтверждение оплаты администратором
-✅ Мгновенное автоподтверждение если userbot видит подарок
-✅ Большие файлы (10MB/.py, 50MB/.zip)
-"""
-
 import os
 import sys
 import asyncio
@@ -29,16 +21,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # ═══════════════════════════════════════════════════════════════
-# 🔧 КОНФИГУРАЦИЯ
+# 🔧 КОНФИГУРАЦИЯ (только токен и ID владельца)
 # ═══════════════════════════════════════════════════════════════
 
 BOT_TOKEN      = "8711311188:AAHnhjvLhyYASMxUI-1hLyktHXhSsmYXnww"
-OWNER_ID       = int(os.environ["8269807543"])
-OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "")
-OWNER_PHONE    = os.environ.get("OWNER_PHONE", "")
-OWNER_API_ID   = os.environ.get("OWNER_API_ID", "")
-OWNER_API_HASH = os.environ.get("OWNER_API_HASH", "")
-OWNER_SESSION  = os.environ.get("OWNER_SESSION", "")   # ← StringSession строка
+OWNER_ID       = int(os.environ.get("OWNER_ID", "8269807543"))
 
 DATA_DIR     = Path("./data")
 BOTS_DIR     = DATA_DIR / "bots"
@@ -69,14 +56,6 @@ log = logging.getLogger("BotHost")
 bot          = Bot(token=BOT_TOKEN)
 dp           = Dispatcher(storage=MemoryStorage())
 running_bots: Dict[int, subprocess.Popen] = {}
-gift_queue:   Dict[int, List[dict]]        = {}
-
-userbot_status = {
-    "connected": False,
-    "phone":     OWNER_PHONE or "не задан",
-    "client":    None,
-}
-
 
 # ═══════════════════════════════════════════════════════════════
 # 💾 БАЗА ДАННЫХ
@@ -287,7 +266,7 @@ def update_main_file(bot_id: int, main_file: str):
         conn.execute("UPDATE bots SET main_file=? WHERE id=?", (main_file, bot_id))
 
 
-# ─── Gifts ────────────────────────────────────────────────────
+# ─── Gifts (сохранены для истории, но автоматика не используется) ──
 
 def save_gift(uid: int, username: str, stars: int, gift_id: str) -> bool:
     try:
@@ -300,33 +279,6 @@ def save_gift(uid: int, username: str, stars: int, gift_id: str) -> bool:
         return True
     except sqlite3.IntegrityError:
         return False
-
-
-def find_gift(uid: int, min_stars: int) -> Optional[tuple]:
-    with db() as conn:
-        cutoff = (datetime.now() - timedelta(minutes=60)).isoformat()
-        r = conn.execute(
-            "SELECT id,stars,gift_id FROM gifts "
-            "WHERE user_id=? AND status='pending' AND stars>=? "
-            "AND created_at>=? ORDER BY created_at DESC LIMIT 1",
-            (uid, min_stars, cutoff)
-        ).fetchone()
-        if not r:
-            r = conn.execute(
-                "SELECT id,stars,gift_id FROM gifts "
-                "WHERE user_id=? AND status='pending' AND stars>=? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (uid, min_stars)
-            ).fetchone()
-    return r
-
-
-def use_gift(gift_db_id: int, plan: str):
-    with db() as conn:
-        conn.execute(
-            "UPDATE gifts SET status='used', plan=? WHERE id=?",
-            (plan, gift_db_id)
-        )
 
 
 def get_stats():
@@ -351,323 +303,7 @@ def get_stats():
         running=len(running_bots),
         gifts=gr[0], stars=gr[1],
         manual_payments=mp,
-        ub_ok=userbot_status["connected"],
-        ub_phone=userbot_status["phone"],
     )
-
-
-# ═══════════════════════════════════════════════════════════════
-# 🎁 USERBOT — TELETHON (StringSession)
-# ═══════════════════════════════════════════════════════════════
-
-def _extract_stars(action) -> int:
-    for attr in ["stars", "cost", "amount", "credits", "count"]:
-        v = getattr(action, attr, None)
-        if isinstance(v, int) and v > 0:
-            return v
-    gift_obj = getattr(action, "gift", None)
-    if gift_obj:
-        for attr in ["stars", "cost", "amount"]:
-            v = getattr(gift_obj, attr, None)
-            if isinstance(v, int) and v > 0:
-                return v
-    data_str = str(action)
-    for pattern in [r"stars=(\d+)", r"cost=(\d+)", r"amount=(\d+)"]:
-        m = re.search(pattern, data_str)
-        if m:
-            v = int(m.group(1))
-            if v > 0:
-                return v
-    return 0
-
-
-async def gift_received(sender_id: int, username: str, stars: int, gift_id: str):
-    """Обрабатывает входящий подарок от userbot."""
-    if not save_gift(sender_id, username, stars, gift_id):
-        return  # дубликат
-
-    # В очередь памяти для мгновенного подтверждения
-    if sender_id not in gift_queue:
-        gift_queue[sender_id] = []
-    gift_queue[sender_id].append({
-        "value": stars, "gift_id": gift_id, "ts": datetime.now()
-    })
-    cutoff = datetime.now() - timedelta(hours=2)
-    gift_queue[sender_id] = [
-        g for g in gift_queue[sender_id] if g["ts"] >= cutoff
-    ]
-
-    log.info(f"🎁 Подарок: {sender_id} (@{username}) → {stars}⭐")
-
-    # Определяем подходящий план
-    plan_id = None
-    for pid, p in sorted(PLANS.items(), key=lambda x: x[1]["stars"], reverse=True):
-        if stars >= p["stars"]:
-            plan_id = pid
-            break
-
-    # Уведомляем клиента с кнопкой активации
-    try:
-        if plan_id:
-            plan = PLANS[plan_id]
-            await bot.send_message(
-                sender_id,
-                f"🎁 <b>Подарок получен!</b>\n\n"
-                f"💎 {stars}⭐ — тариф <b>«{plan['name']}»</b>\n\n"
-                f"Нажми чтобы активировать:",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(
-                        text=f"✅ Активировать «{plan['name']}»",
-                        callback_data=f"confirm:{plan_id}"
-                    )],
-                    [InlineKeyboardButton(
-                        text="💎 Другой тариф",
-                        callback_data="buy"
-                    )],
-                ])
-            )
-        else:
-            await bot.send_message(
-                sender_id,
-                f"🎁 Получили {stars}⭐, но минимум для слота — "
-                f"{PLANS['week']['stars']}⭐"
-            )
-    except Exception as e:
-        log.error(f"Уведомление {sender_id}: {e}")
-
-    # Уведомляем владельца
-    try:
-        await bot.send_message(
-            OWNER_ID,
-            f"🎁 <b>Новый подарок!</b>\n"
-            f"👤 @{username} (<code>{sender_id}</code>)\n"
-            f"💎 {stars}⭐ → "
-            f"{PLANS[plan_id]['name'] if plan_id else 'недостаточно'}\n\n"
-            f"<i>Подарок зарегистрирован автоматически</i>",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
-
-
-async def run_userbot():
-    """Запускает userbot через StringSession — без кодов авторизации."""
-    global userbot_status
-
-    if not all([OWNER_API_ID, OWNER_API_HASH, OWNER_SESSION]):
-        log.warning(
-            "⚠️ Userbot не запущен.\n"
-            "   Нужны переменные: OWNER_API_ID, OWNER_API_HASH, OWNER_SESSION\n"
-            "   Создай сессию скриптом make_session.py"
-        )
-        return
-
-    # Устанавливаем telethon если нет
-    try:
-        import telethon
-    except ImportError:
-        log.info("📦 Устанавливаю telethon...")
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install", "-q", "telethon"
-        ])
-
-    from telethon import TelegramClient, events
-    from telethon.sessions import StringSession
-
-    while True:
-        try:
-            client = TelegramClient(
-                StringSession(OWNER_SESSION),
-                int(OWNER_API_ID),
-                OWNER_API_HASH,
-                device_model="BotHost Server",
-                system_version="Linux x64",
-                app_version="1.0"
-            )
-            userbot_status["client"] = client
-
-            await client.connect()
-
-            if not await client.is_user_authorized():
-                log.error("❌ OWNER_SESSION недействителен!")
-                try:
-                    await bot.send_message(
-                        OWNER_ID,
-                        "❌ <b>OWNER_SESSION недействителен!</b>\n\n"
-                        "Создай новую сессию скриптом:\n"
-                        "<pre>python make_session.py</pre>\n"
-                        "И обнови переменную OWNER_SESSION в Railway.",
-                        parse_mode="HTML"
-                    )
-                except Exception:
-                    pass
-                return  # Не перезапускаем — сессия невалидна
-
-            me = await client.get_me()
-            userbot_status["connected"] = True
-            userbot_status["phone"] = f"{me.first_name} ({me.phone or OWNER_PHONE})"
-
-            log.info(f"✅ Userbot: {me.first_name} ({me.id})")
-
-            try:
-                await bot.send_message(
-                    OWNER_ID,
-                    f"✅ <b>Userbot подключён!</b>\n\n"
-                    f"👤 {html.escape(me.first_name)} "
-                    f"{html.escape(me.last_name or '')}\n"
-                    f"📱 {me.phone or OWNER_PHONE}\n"
-                    f"🆔 <code>{me.id}</code>\n\n"
-                    f"👁 Слежу за подарками...",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
-
-            # ── Обработчик Raw updates (все типы подарков) ────
-
-            @client.on(events.Raw())
-            async def on_raw(update):
-                try:
-                    if not hasattr(update, "message"):
-                        return
-                    msg = update.message
-                    if not hasattr(msg, "action") or not msg.action:
-                        return
-                    action      = msg.action
-                    action_name = type(action).__name__.lower()
-                    if not any(k in action_name for k in
-                               ["gift", "star", "premium"]):
-                        return
-
-                    from_id = getattr(msg, "from_id", None)
-                    if hasattr(from_id, "user_id"):
-                        sid = from_id.user_id
-                    elif isinstance(from_id, int):
-                        sid = from_id
-                    else:
-                        return
-
-                    if sid == OWNER_ID:
-                        return
-
-                    stars = _extract_stars(action)
-                    if stars <= 0:
-                        return
-
-                    try:
-                        entity = await client.get_entity(sid)
-                        uname  = (
-                            getattr(entity, "username", None)
-                            or getattr(entity, "first_name", str(sid))
-                        )
-                    except Exception:
-                        uname = str(sid)
-
-                    gift_id = f"raw_{sid}_{msg.id}_{int(datetime.now().timestamp())}"
-                    await gift_received(sid, uname, stars, gift_id)
-
-                except Exception as e:
-                    log.error(f"raw handler: {e}")
-
-            # ── Обработчик NewMessage (сервисные сообщения) ───
-
-            @client.on(events.NewMessage(incoming=True))
-            async def on_msg(event):
-                try:
-                    msg = event.message
-                    if not getattr(msg, "action", None):
-                        return
-                    action      = msg.action
-                    action_name = type(action).__name__.lower()
-                    if not any(k in action_name for k in
-                               ["gift", "star", "premium"]):
-                        return
-
-                    sender = await event.get_sender()
-                    if not sender or getattr(sender, "id", 0) == OWNER_ID:
-                        return
-
-                    stars = _extract_stars(action)
-                    if stars <= 0:
-                        return
-
-                    uname = (
-                        getattr(sender, "username", None)
-                        or getattr(sender, "first_name", str(sender.id))
-                    )
-                    gift_id = f"msg_{sender.id}_{msg.id}_{int(datetime.now().timestamp())}"
-                    await gift_received(sender.id, uname, stars, gift_id)
-
-                except Exception as e:
-                    log.error(f"msg handler: {e}")
-
-            # ── Фоновый polling каждые 5 минут (подстраховка) ─
-
-            async def backup_poll():
-                await asyncio.sleep(60)
-                while client.is_connected():
-                    try:
-                        async for dialog in client.iter_dialogs(limit=20):
-                            try:
-                                async for msg in client.iter_messages(
-                                    dialog.entity, limit=5
-                                ):
-                                    if not getattr(msg, "action", None):
-                                        continue
-                                    an = type(msg.action).__name__.lower()
-                                    if not any(k in an for k in ["gift", "star"]):
-                                        continue
-                                    from_id = getattr(msg, "from_id", None)
-                                    if hasattr(from_id, "user_id"):
-                                        sid = from_id.user_id
-                                    elif isinstance(from_id, int):
-                                        sid = from_id
-                                    else:
-                                        continue
-                                    if sid == OWNER_ID:
-                                        continue
-                                    stars = _extract_stars(msg.action)
-                                    if stars <= 0:
-                                        continue
-                                    gid    = f"poll_{sid}_{msg.id}"
-                                    is_new = save_gift(sid, str(sid), stars, gid)
-                                    if is_new:
-                                        if sid not in gift_queue:
-                                            gift_queue[sid] = []
-                                        gift_queue[sid].append({
-                                            "value": stars,
-                                            "gift_id": gid,
-                                            "ts": datetime.now(),
-                                        })
-                                        log.info(f"📬 Poll: {sid} → {stars}⭐")
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        log.error(f"backup_poll: {e}")
-                    await asyncio.sleep(300)
-
-            asyncio.create_task(backup_poll())
-            log.info("👁 Userbot слушает подарки")
-            await client.run_until_disconnected()
-
-        except Exception as e:
-            log.error(f"Userbot error: {e}")
-            userbot_status["connected"] = False
-            userbot_status["client"]    = None
-            try:
-                await bot.send_message(
-                    OWNER_ID,
-                    f"⚠️ <b>Userbot отключился</b>\n\n"
-                    f"<code>{html.escape(str(e))}</code>\n\n"
-                    f"Переподключаюсь через 30 сек...",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
-
-        log.info("🔄 Userbot переподключается через 30 сек...")
-        await asyncio.sleep(30)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -778,6 +414,7 @@ async def start_bot(bot_id: int, token: str, main_file: str = "main.py") -> bool
             "BOTHOST_MAIN": main_file,
             "PYTHONUNBUFFERED": "1",
         }
+        # удаляем лишние переменные, которые могли бы мешать
         for k in ["OWNER_PHONE", "OWNER_API_ID", "OWNER_API_HASH",
                   "OWNER_TELEGRAM_ID", "OWNER_SESSION"]:
             env.pop(k, None)
@@ -884,8 +521,6 @@ async def restore_bots():
 # ═══════════════════════════════════════════════════════════════
 
 def owner_link() -> str:
-    if OWNER_USERNAME:
-        return f"https://t.me/{OWNER_USERNAME}"
     return f"tg://user?id={OWNER_ID}"
 
 
@@ -894,12 +529,13 @@ WELCOME = """👋 <b>Привет, {name}!</b>
 🤖 <b>BotHost</b> — хостинг Telegram-ботов
 
 ━━━━━━━━━━━━━━━━━━━━━
-🎁 <b>Как начать:</b>
-1️⃣ «💎 Купить слот» → тариф
-2️⃣ Отправь подарок владельцу
-3️⃣ Получишь кнопку активации!
-4️⃣ Загрузи .py или .zip бота
-5️⃣ Запусти! ✨
+💎 <b>Как получить слот:</b>
+1️⃣ Нажми «💎 Купить слот»
+2️⃣ Выбери тариф
+3️⃣ Свяжись с владельцем для оплаты
+4️⃣ Администратор активирует слот вручную
+5️⃣ Загрузи .py или .zip бота
+6️⃣ Запусти! ✨
 
 📦 до 10 МБ (.py) / 50 МБ (.zip)
 ━━━━━━━━━━━━━━━━━━━━━
@@ -959,14 +595,6 @@ async def send_welcome(target, edit: bool = False):
             pass
 
     await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
-
-
-def _check_queue(uid: int, min_stars: int) -> Optional[dict]:
-    cutoff = datetime.now() - timedelta(minutes=60)
-    for g in gift_queue.get(uid, []):
-        if g["value"] >= min_stars and g["ts"] >= cutoff:
-            return g
-    return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1532,29 +1160,6 @@ async def cmd_admin_cmd(msg: types.Message, state: FSMContext):
     await show_admin(msg)
 
 
-@dp.message(Command("ubstatus"))
-async def cmd_ubstatus(msg: types.Message):
-    """Статус userbot."""
-    if msg.from_user.id != OWNER_ID:
-        return
-    client    = userbot_status.get("client")
-    connected = userbot_status["connected"]
-    if connected and client:
-        try:
-            me   = await client.get_me()
-            text = (
-                f"📡 <b>Userbot</b>\n\n🟢 Подключён\n"
-                f"👤 {html.escape(me.first_name)}\n"
-                f"📱 {me.phone or OWNER_PHONE}\n"
-                f"🆔 <code>{me.id}</code>"
-            )
-        except Exception:
-            text = "📡 🟡 Нестабильно"
-    else:
-        text = f"📡 <b>Userbot</b>\n\n🔴 Не подключён"
-    await msg.answer(text, parse_mode="HTML")
-
-
 @dp.message(Command("pay"))
 async def cmd_pay(msg: types.Message, state: FSMContext):
     """
@@ -1673,152 +1278,25 @@ async def cb_buy(call: types.CallbackQuery, state: FSMContext):
     uid = call.from_user.id
     if is_banned(uid):
         return await call.answer("🚫 Заблокированы", show_alert=True)
-    if uid == OWNER_ID or is_admin(uid):
-        return await call.message.edit_text(
-            "👑 У тебя безлимит!",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
-            ])
-        )
-    await call.message.edit_text(
-        "💎 <b>Выбери тариф</b>\n\nОплата подарком в Telegram Stars:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text=f"📅 Неделя — {PLANS['week']['stars']}⭐",
-                callback_data="plan:week"
-            )],
-            [InlineKeyboardButton(
-                text=f"📅 2 недели — {PLANS['2weeks']['stars']}⭐",
-                callback_data="plan:2weeks"
-            )],
-            [InlineKeyboardButton(
-                text=f"🗓 Месяц — {PLANS['month']['stars']}⭐",
-                callback_data="plan:month"
-            )],
-            [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
-        ]),
-        parse_mode="HTML"
+
+    # Показываем тарифы и просим обратиться к администратору
+    text = (
+        "💎 <b>Выбери тариф</b>\n\n"
+        "Оплата производится вручную. После выбора тарифа свяжись с владельцем для получения реквизитов.\n\n"
     )
-
-
-@dp.callback_query(F.data.startswith("plan:"))
-async def cb_plan(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    plan_id = call.data.split(":")[1]
-    plan    = PLANS[plan_id]
-    uid     = call.from_user.id
-
-    # Мгновенная проверка — есть ли уже подарок?
-    rt = _check_queue(uid, plan["stars"])
-    dg = find_gift(uid, plan["stars"])
-
-    if rt or dg:
-        val = rt["value"] if rt else dg[1]
-        return await call.message.edit_text(
-            f"🎁 <b>Подарок уже получен!</b>\n\n"
-            f"💎 {val}⭐ → «{plan['name']}»\n\n"
-            f"Нажми чтобы активировать:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text=f"✅ Активировать «{plan['name']}»",
-                    callback_data=f"confirm:{plan_id}"
-                )],
-                [InlineKeyboardButton(text="« Назад", callback_data="buy")],
-            ]),
-            parse_mode="HTML"
-        )
+    for pid, p in PLANS.items():
+        text += f"{p['emoji']} <b>{p['name']}</b> — {p['stars']}⭐ ({p['days']} дней)\n"
+    text += "\n<i>После оплаты администратор активирует слот вручную.</i>"
 
     await call.message.edit_text(
-        f"{plan['emoji']} <b>«{plan['name']}»</b>\n\n"
-        f"💎 {plan['stars']}⭐ | 📅 {plan['days']} дней\n\n"
-        f"<b>Как оплатить:</b>\n"
-        f"1️⃣ Нажми «🎁 Подарить»\n"
-        f"2️⃣ Выбери подарок от {plan['stars']}⭐\n"
-        f"3️⃣ Отправь владельцу\n"
-        f"4️⃣ Получишь кнопку активации автоматически!\n\n"
-        f"<i>Или нажми «✅ Уже отправил» для проверки</i>",
+        text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎁 Подарить", url=owner_link())],
-            [InlineKeyboardButton(
-                text="✅ Уже отправил",
-                callback_data=f"confirm:{plan_id}"
-            )],
-            [InlineKeyboardButton(text="« Назад", callback_data="buy")],
+            [InlineKeyboardButton(text="👤 Связаться с владельцем", url=owner_link())],
+            [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
         ]),
         parse_mode="HTML",
         disable_web_page_preview=True
     )
-
-
-@dp.callback_query(F.data.startswith("confirm:"))
-async def cb_confirm(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    plan_id = call.data.split(":")[1]
-    plan    = PLANS[plan_id]
-    uid     = call.from_user.id
-    await call.answer("⏳ Проверяю...")
-
-    rt = _check_queue(uid, plan["stars"])
-    dg = find_gift(uid, plan["stars"])
-
-    if not rt and not dg:
-        return await call.message.edit_text(
-            f"❌ <b>Подарок не найден</b>\n\n"
-            f"Нужно: от {plan['stars']}⭐\n\n"
-            f"Подожди 1-2 минуты и попробуй снова.\n"
-            f"Если проблема — напиши владельцу.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="🔄 Проверить снова",
-                    callback_data=f"confirm:{plan_id}"
-                )],
-                [InlineKeyboardButton(
-                    text="🎁 Подарить",
-                    url=owner_link()
-                )],
-                [InlineKeyboardButton(
-                    text="👤 Написать владельцу",
-                    url=owner_link()
-                )],
-                [InlineKeyboardButton(text="« Тарифы", callback_data="buy")],
-            ]),
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-
-    gift_id = rt["gift_id"] if rt else dg[2]
-    stars   = rt["value"]   if rt else dg[1]
-
-    if dg:
-        use_gift(dg[0], plan_id)
-    if rt and uid in gift_queue:
-        gift_queue[uid] = [
-            g for g in gift_queue[uid] if g["gift_id"] != gift_id
-        ]
-
-    exp = add_slot(uid, plan_id, gift_id)
-    await call.message.edit_text(
-        f"✅ <b>Активировано!</b>\n\n"
-        f"🎁 {stars}⭐ → {plan['emoji']} <b>{plan['name']}</b>\n"
-        f"📅 До: <b>{exp.strftime('%d.%m.%Y')}</b>\n\n"
-        f"🎉 Загружай бота!",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📤 Загрузить бота", callback_data="upload")],
-            [InlineKeyboardButton(text="📊 Мои слоты",      callback_data="myslots")],
-            [InlineKeyboardButton(text="« Меню",            callback_data="back_main")],
-        ]),
-        parse_mode="HTML"
-    )
-    try:
-        await bot.send_message(
-            OWNER_ID,
-            f"💰 <b>Оплата!</b>\n"
-            f"👤 @{call.from_user.username or '—'} (<code>{uid}</code>)\n"
-            f"💎 {stars}⭐ → {plan['name']}",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
 
 
 @dp.callback_query(F.data == "upload")
@@ -2088,10 +1566,10 @@ async def cb_help(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.edit_text(
         "❓ <b>Помощь</b>\n\n"
-        "<b>Покупка слота:</b>\n"
-        "1. «Купить слот» → выбери тариф\n"
-        "2. Отправь подарок владельцу\n"
-        "3. Получишь кнопку активации\n\n"
+        "<b>Получение слота:</b>\n"
+        "1. Нажми «Купить слот» и выбери тариф\n"
+        "2. Свяжись с владельцем для оплаты\n"
+        "3. Администратор активирует слот вручную\n\n"
         "<b>Загрузка бота:</b>\n"
         "1. «Загрузить бота» → .py/.zip\n"
         "2. Токен или none\n"
@@ -2112,17 +1590,14 @@ async def cb_help(call: types.CallbackQuery, state: FSMContext):
 
 async def show_admin(target, edit: bool = False):
     s  = get_stats()
-    ub = f"{'🟢' if s['ub_ok'] else '🔴'} {s['ub_phone']}"
     txt = (
         f"🔐 <b>Админка</b>\n\n"
         f"👥 {s['total_users']} | 🚫 {s['banned']} | 🛡 {s['admins']}\n"
         f"💳 Слотов: {s['active_slots']}\n"
         f"🤖 Ботов: {s['total_bots']} (🟢{s['running']})\n"
         f"🎁 {s['gifts']} авто / {s['manual_payments']} ручных / {s['stars']}⭐\n"
-        f"📡 Userbot: {ub}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📡 Userbot",         callback_data="adm:userbot")],
         [InlineKeyboardButton(text="💳 Выдать слот",     callback_data="adm:manualpay")],
         [InlineKeyboardButton(text="📢 Рассылка",         callback_data="adm:bc")],
         [InlineKeyboardButton(text="👥 Юзеры",            callback_data="adm:users")],
@@ -2174,72 +1649,6 @@ async def cb_adm_manualpay(call: types.CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await state.set_state(Admin.manual_pay)
-
-
-@dp.callback_query(F.data == "adm:userbot")
-async def cb_adm_userbot(call: types.CallbackQuery):
-    if call.from_user.id != OWNER_ID:
-        return await call.answer("⚠️ Только владелец", show_alert=True)
-
-    client    = userbot_status.get("client")
-    connected = userbot_status["connected"]
-
-    if connected and client:
-        try:
-            me = await client.get_me()
-            status_text = (
-                f"🟢 <b>Подключён</b>\n"
-                f"👤 {html.escape(me.first_name)} {html.escape(me.last_name or '')}\n"
-                f"📱 {me.phone or OWNER_PHONE}\n"
-                f"🆔 <code>{me.id}</code>"
-            )
-        except Exception:
-            status_text = "🟡 Нестабильное соединение"
-    else:
-        status_text = f"🔴 <b>Не подключён</b>"
-
-    has_session = bool(OWNER_SESSION)
-
-    await call.message.edit_text(
-        f"📡 <b>Userbot</b>\n\n"
-        f"{status_text}\n\n"
-        f"{'✅ OWNER_SESSION задан' if has_session else '❌ OWNER_SESSION не задан'}\n\n"
-        f"Для создания сессии запусти локально:\n"
-        f"<code>python make_session.py</code>\n"
-        f"И добавь в Railway: OWNER_SESSION=...",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="🔄 Перезапустить",
-                callback_data="adm:ub_restart"
-            )],
-            [InlineKeyboardButton(
-                text="🔄 Обновить статус",
-                callback_data="adm:userbot"
-            )],
-            [InlineKeyboardButton(text="« Админка", callback_data="admin")],
-        ]),
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data == "adm:ub_restart")
-async def cb_ub_restart(call: types.CallbackQuery):
-    if call.from_user.id != OWNER_ID:
-        return await call.answer("⚠️ Только владелец", show_alert=True)
-    await call.answer("🔄 Перезапускаю...")
-    client = userbot_status.get("client")
-    if client:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-    userbot_status["connected"] = False
-    userbot_status["client"]    = None
-    asyncio.create_task(run_userbot())
-    await call.message.answer(
-        "🔄 <b>Userbot перезапускается...</b>",
-        parse_mode="HTML"
-    )
 
 
 @dp.callback_query(F.data == "adm:bc")
@@ -2372,22 +1781,12 @@ async def cb_adm_restart(call: types.CallbackQuery):
 async def main():
     init_db()
     log.info("=" * 55)
-    log.info("🤖 BotHost v3.2")
+    log.info("🤖 BotHost v3.2 (без Userbot)")
     log.info(f"👤 Владелец: {OWNER_ID}")
-    log.info(f"📡 Userbot: {'✅ сессия есть' if OWNER_SESSION else '❌ нет OWNER_SESSION'}")
     log.info("=" * 55)
 
     await restore_bots()
     asyncio.create_task(monitor())
-
-    if OWNER_SESSION and OWNER_API_ID and OWNER_API_HASH:
-        asyncio.create_task(run_userbot())
-    else:
-        log.warning(
-            "Userbot не запущен.\n"
-            "Нужны: OWNER_SESSION + OWNER_API_ID + OWNER_API_HASH\n"
-            "Создай сессию: python make_session.py"
-        )
 
     await dp.start_polling(bot)
 
