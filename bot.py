@@ -1247,10 +1247,9 @@ async def handle_photo(msg: types.Message):
 # ─── CALLBACKS ────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════
 
-async def edit_or_answer(call: types.CallbackQuery, text: str, kb: InlineKeyboardMarkup = None, parse_mode: str = "HTML"):
-    """Универсальная функция для редактирования или отправки нового сообщения."""
+async def edit_or_reply(call: types.CallbackQuery, text: str, kb: InlineKeyboardMarkup = None, parse_mode: str = "HTML"):
+    """Универсальная функция: редактирует если можно, иначе отправляет новое."""
     try:
-        # Если сообщение содержит фото, редактируем caption
         if call.message.photo:
             await call.message.edit_caption(
                 caption=text,
@@ -1264,9 +1263,12 @@ async def edit_or_answer(call: types.CallbackQuery, text: str, kb: InlineKeyboar
                 parse_mode=parse_mode
             )
     except Exception as e:
-        # Если не удалось отредактировать, отправляем новое
-        log.error(f"Ошибка редактирования: {e}")
-        await call.message.answer(text, reply_markup=kb, parse_mode=parse_mode)
+        # Если не удалось отредактировать (сообщение старое или удалено)
+        try:
+            await call.message.answer(text, reply_markup=kb, parse_mode=parse_mode)
+        except Exception:
+            # Если и это не вышло, просто шлём новое в чат
+            await bot.send_message(call.from_user.id, text, reply_markup=kb, parse_mode=parse_mode)
 
 
 @dp.callback_query(F.data == "back_main")
@@ -1301,7 +1303,7 @@ async def cb_buy(call: types.CallbackQuery, state: FSMContext):
     ] + [
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
 
 
 @dp.callback_query(F.data.startswith("buy_plan:"))
@@ -1326,7 +1328,7 @@ async def cb_buy_plan(call: types.CallbackQuery):
         [InlineKeyboardButton(text="« Назад", callback_data="buy")],
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
     await call.answer()
 
 
@@ -1366,7 +1368,7 @@ async def cb_pay_notify(call: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
 
 
 @dp.callback_query(F.data == "upload")
@@ -1387,7 +1389,7 @@ async def cb_upload(call: types.CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="« Отмена", callback_data="back_main")]
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
     await state.set_state(Upload.file)
 
 
@@ -1401,7 +1403,7 @@ async def cb_mybots(call: types.CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="📤 Загрузить", callback_data="upload")],
             [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
         ])
-        await edit_or_answer(call, text, kb)
+        await edit_or_reply(call, text, kb)
         return
     rows = []
     for b in bots:
@@ -1415,7 +1417,7 @@ async def cb_mybots(call: types.CallbackQuery, state: FSMContext):
     rows.append([InlineKeyboardButton(text="« Меню", callback_data="back_main")])
     text = f"🤖 <b>Твои боты ({len(bots)})</b>\n🟢 работает · 🔴 стоп"
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
 
 
 @dp.callback_query(F.data.startswith("bot:"))
@@ -1446,7 +1448,7 @@ async def cb_bot(call: types.CallbackQuery):
         [InlineKeyboardButton(text="« Список",          callback_data="mybots")],
         [InlineKeyboardButton(text="« Меню",            callback_data="back_main")],
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
 
 
 @dp.callback_query(F.data.startswith("start:"))
@@ -1552,7 +1554,7 @@ async def cb_files(call: types.CallbackQuery):
         [InlineKeyboardButton(text="« К боту",   callback_data=f"bot:{bid}")],
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
     ])
-    await edit_or_answer(call, txt, kb)
+    await edit_or_reply(call, txt, kb)
 
 
 @dp.callback_query(F.data.startswith("changemain:"))
@@ -1578,7 +1580,7 @@ async def cb_addfile(call: types.CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="« Отмена", callback_data=f"bot:{bid}")]
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
     await state.update_data(bot_id=bid)
     await state.set_state(Upload.add_file)
 
@@ -1597,6 +1599,7 @@ async def cb_del(call: types.CallbackQuery):
         pass
     del_bot(bid)
     await call.answer("🗑 Удалён")
+    # Обновляем список ботов
     await cb_mybots(call)
 
 
@@ -1620,7 +1623,7 @@ async def cb_myslots(call: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="💎 Купить ещё", callback_data="buy")],
         [InlineKeyboardButton(text="« Меню",        callback_data="back_main")],
     ])
-    await edit_or_answer(call, txt, kb)
+    await edit_or_reply(call, txt, kb)
 
 
 @dp.callback_query(F.data == "help")
@@ -1644,7 +1647,7 @@ async def cb_help(call: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="👤 Владелец", url=owner_link())],
         [InlineKeyboardButton(text="« Меню",      callback_data="back_main")],
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
 
 
 # ─── ADMIN ────────────────────────────────────────────────────
@@ -1675,7 +1678,7 @@ async def show_admin(target, edit: bool = False):
         [InlineKeyboardButton(text="« Меню",             callback_data="back_main")],
     ])
     if edit:
-        await edit_or_answer(target, text, kb)
+        await edit_or_reply(target, text, kb)
     else:
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
 
@@ -1708,7 +1711,7 @@ async def cb_adm_manualpay(call: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="« Назад", callback_data="admin")],
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
     await state.set_state(Admin.manual_pay)
 
 
@@ -1721,7 +1724,7 @@ async def cb_adm_bc(call: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="« Назад", callback_data="admin")],
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
     await state.set_state(Admin.broadcast)
 
 
@@ -1742,7 +1745,7 @@ async def cb_adm_users(call: types.CallbackQuery):
         [InlineKeyboardButton(text="« Админка", callback_data="admin")],
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
     ])
-    await edit_or_answer(call, txt, kb)
+    await edit_or_reply(call, txt, kb)
 
 
 @dp.callback_query(F.data == "adm:ban")
@@ -1754,7 +1757,7 @@ async def cb_adm_ban(call: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="« Назад", callback_data="admin")],
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
     await state.set_state(Admin.ban)
 
 
@@ -1767,7 +1770,7 @@ async def cb_adm_unban(call: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="« Назад", callback_data="admin")],
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
     await state.set_state(Admin.unban)
 
 
@@ -1780,7 +1783,7 @@ async def cb_adm_addadmin(call: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="« Назад", callback_data="admin")],
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
     await state.set_state(Admin.addadmin)
 
 
@@ -1800,7 +1803,7 @@ async def cb_adm_remadmin(call: types.CallbackQuery):
     ]
     rows.append([InlineKeyboardButton(text="« Отмена", callback_data="admin")])
     rows.append([InlineKeyboardButton(text="« Меню", callback_data="back_main")])
-    await edit_or_answer(call, "❌ Удалить админа:", InlineKeyboardMarkup(inline_keyboard=rows))
+    await edit_or_reply(call, "❌ Удалить админа:", InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @dp.callback_query(F.data.startswith("remadm:"))
@@ -1822,7 +1825,7 @@ async def cb_adm_welcome(call: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="« Назад", callback_data="admin")],
         [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
     ])
-    await edit_or_answer(call, text, kb)
+    await edit_or_reply(call, text, kb)
     await state.set_state(Admin.welcome)
 
 
