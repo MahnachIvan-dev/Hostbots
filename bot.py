@@ -561,23 +561,36 @@ def main_kb(uid: int) -> InlineKeyboardMarkup:
 
 
 async def send_welcome(target, edit: bool = False):
-    if hasattr(target, "from_user"):
-        uid     = target.from_user.id
-        name    = html.escape(target.from_user.first_name or "друг")
+    # Определяем тип входящего объекта
+    if isinstance(target, types.Message):
+        uid = target.from_user.id
+        name = html.escape(target.from_user.first_name or "друг")
         chat_id = target.chat.id
-    else:
-        uid     = target.from_user.id
-        name    = html.escape(target.from_user.first_name or "друг")
+        message = target
+    elif isinstance(target, types.CallbackQuery):
+        uid = target.from_user.id
+        name = html.escape(target.from_user.first_name or "друг")
         chat_id = target.message.chat.id
+        message = target.message
+    else:
+        # fallback (маловероятно)
+        uid = getattr(target, 'from_user', None)
+        if uid:
+            uid = uid.id
+        else:
+            uid = 0
+        name = "друг"
+        chat_id = uid
+        message = None
 
     text = WELCOME.format(name=name)
     kb   = main_kb(uid)
 
     if WELCOME_IMG.exists():
         try:
-            if edit:
+            if edit and message:
                 try:
-                    await target.message.delete()
+                    await message.delete()
                 except Exception:
                     pass
             await bot.send_photo(
@@ -588,9 +601,9 @@ async def send_welcome(target, edit: bool = False):
         except Exception as e:
             log.error(f"send_photo: {e}")
 
-    if edit:
+    if edit and message:
         try:
-            await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
             return
         except Exception:
             pass
@@ -1282,7 +1295,7 @@ async def cb_back(call: types.CallbackQuery, state: FSMContext):
         await call.message.delete()
     except Exception:
         pass
-    await send_welcome(call)
+    await send_welcome(call)  # call — это CallbackQuery
 
 
 @dp.callback_query(F.data == "buy")
