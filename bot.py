@@ -24,7 +24,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # 🔧 КОНФИГУРАЦИЯ (только токен и ID владельца)
 # ═══════════════════════════════════════════════════════════════
 
-BOT_TOKEN      = "8711311188:AAHnhjvLhyYASMxUI-1hLyktHXhSsmYXnww"
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "8711311188:AAHnhjvLhyYASMxUI-1hLyktHXhSsmYXnww")
 OWNER_ID       = int(os.environ.get("OWNER_ID", "8269807543"))
 
 DATA_DIR     = Path("./data")
@@ -52,6 +52,10 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 log = logging.getLogger("BotHost")
+
+if not BOT_TOKEN or OWNER_ID == 0:
+    log.error("❌ BOT_TOKEN и OWNER_ID должны быть заданы в переменных окружения!")
+    sys.exit(1)
 
 bot          = Bot(token=BOT_TOKEN)
 dp           = Dispatcher(storage=MemoryStorage())
@@ -614,7 +618,7 @@ class Admin(StatesGroup):
     unban        = State()
     addadmin     = State()
     welcome      = State()
-    manual_pay   = State()   # ручное подтверждение оплаты
+    manual_pay   = State()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -781,11 +785,6 @@ async def fsm_welcome_text(msg: types.Message, state: FSMContext):
 
 @dp.message(Admin.manual_pay)
 async def fsm_manual_pay(msg: types.Message, state: FSMContext):
-    """
-    Ручное подтверждение оплаты.
-    Формат: user_id plan [звёзды] [заметка]
-    Пример: 123456789 month 50 оплата переводом
-    """
     if not is_admin(msg.from_user.id):
         return await state.clear()
     if msg.text == "/cancel":
@@ -824,7 +823,6 @@ async def fsm_manual_pay(msg: types.Message, state: FSMContext):
 
     note = parts[3] if len(parts) >= 4 else "ручное подтверждение"
 
-    # Проверяем что пользователь существует
     with db() as conn:
         user_row = conn.execute(
             "SELECT username, full_name FROM users WHERE user_id=?", (uid,)
@@ -841,7 +839,6 @@ async def fsm_manual_pay(msg: types.Message, state: FSMContext):
     full_name = user_row[1] or "—"
     plan      = PLANS[plan_id]
 
-    # Сохраняем в manual_payments
     with db() as conn:
         conn.execute(
             "INSERT INTO manual_payments(user_id,plan,stars,note,created_at,approved_by) "
@@ -849,10 +846,8 @@ async def fsm_manual_pay(msg: types.Message, state: FSMContext):
             (uid, plan_id, stars, note, datetime.now().isoformat(), msg.from_user.id)
         )
 
-    # Создаём слот
     exp = add_slot(uid, plan_id, f"manual_{uid}_{int(datetime.now().timestamp())}")
 
-    # Уведомляем пользователя
     try:
         await bot.send_message(
             uid,
@@ -1162,13 +1157,8 @@ async def cmd_admin_cmd(msg: types.Message, state: FSMContext):
 
 @dp.message(Command("pay"))
 async def cmd_pay(msg: types.Message, state: FSMContext):
-    """
-    /pay user_id plan [stars] [note]
-    Быстрое ручное подтверждение оплаты через команду.
-    """
     if not is_admin(msg.from_user.id):
         return
-
     parts = msg.text.strip().split(maxsplit=4)
     if len(parts) < 3:
         return await msg.answer(
@@ -1279,25 +1269,95 @@ async def cb_buy(call: types.CallbackQuery, state: FSMContext):
     if is_banned(uid):
         return await call.answer("🚫 Заблокированы", show_alert=True)
 
-    # Показываем тарифы и просим обратиться к администратору
-    text = (
-        "💎 <b>Выбери тариф</b>\n\n"
-        "Оплата производится вручную. После выбора тарифа свяжись с владельцем для получения реквизитов.\n\n"
-    )
+    text = "💎 <b>Выбери тариф</b>\n\n"
     for pid, p in PLANS.items():
         text += f"{p['emoji']} <b>{p['name']}</b> — {p['stars']}⭐ ({p['days']} дней)\n"
-    text += "\n<i>После оплаты администратор активирует слот вручную.</i>"
+    text += "\n<i>После выбора нажми «Оплатить» и свяжись с владельцем.</i>"
 
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{p['emoji']} {p['name']} — {p['stars']}⭐",
+            callback_data=f"buy_plan:{pid}"
+        )] for pid in PLANS
+    ] + [
+        [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("buy_plan:"))
+async def cb_buy_plan(call: types.CallbackQuery):
+    plan_id = call.data.split(":", 1)[1]
+    plan = PLANS.get(plan_id)
+    if not plan:
+        return await call.answer("❌ Тариф не найден", show_alert=True)
+
+    text = (
+        f"{plan['emoji']} <b>{plan['name']}</b>\n\n"
+        f"💎 Стоимость: {plan['stars']}⭐\n"
+        f"📅 Длительность: {plan['days']} дней\n\n"
+        "Для оплаты свяжись с владельцем:\n"
+        f"👤 <a href='{owner_link()}'>Написать владельцу</a>\n\n"
+        "После оплаты администратор активирует слот вручную.\n"
+        "Нажми «Я оплатил», чтобы отправить уведомление."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Связаться с владельцем", url=owner_link())],
+        [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"pay_notify:{plan_id}")],
+        [InlineKeyboardButton(text="« Назад", callback_data="buy")],
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pay_notify:"))
+async def cb_pay_notify(call: types.CallbackQuery):
+    plan_id = call.data.split(":", 1)[1]
+    plan = PLANS.get(plan_id)
+    if not plan:
+        return await call.answer("❌ Тариф не найден", show_alert=True)
+
+    uid = call.from_user.id
+    username = call.from_user.username or "—"
+    full_name = call.from_user.full_name or "—"
+
+    # Отправляем уведомление владельцу
+    try:
+        await bot.send_message(
+            OWNER_ID,
+            f"💳 <b>Запрос на оплату</b>\n\n"
+            f"👤 {full_name} (@{username})\n"
+            f"🆔 <code>{uid}</code>\n"
+            f"{plan['emoji']} Тариф: <b>{plan['name']}</b>\n"
+            f"💎 {plan['stars']}⭐\n\n"
+            f"Выдай слот командой:\n"
+            f"<code>/pay {uid} {plan_id}</code>",
+            parse_mode="HTML"
+        )
+        await call.answer("✅ Уведомление отправлено владельцу!", show_alert=True)
+    except Exception as e:
+        log.error(f"Ошибка уведомления владельца: {e}")
+        await call.answer("❌ Не удалось отправить уведомление. Свяжись с владельцем вручную.", show_alert=True)
+
+    # Обновляем сообщение, чтобы не было повторных нажатий
     await call.message.edit_text(
-        text,
+        f"✅ <b>Уведомление отправлено!</b>\n\n"
+        f"Ожидай подтверждения от владельца.\n"
+        f"После активации слота ты сможешь загрузить бота.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👤 Связаться с владельцем", url=owner_link())],
-            [InlineKeyboardButton(text="« Меню", callback_data="back_main")],
+            [InlineKeyboardButton(text="« Меню", callback_data="back_main")]
         ]),
-        parse_mode="HTML",
-        disable_web_page_preview=True
+        parse_mode="HTML"
     )
 
+
+# ─── Остальные callback (не изменились) ─────────────────────
 
 @dp.callback_query(F.data == "upload")
 async def cb_upload(call: types.CallbackQuery, state: FSMContext):
@@ -1629,7 +1689,6 @@ async def cb_admin(call: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "adm:manualpay")
 async def cb_adm_manualpay(call: types.CallbackQuery, state: FSMContext):
-    """Ручное подтверждение оплаты."""
     if not is_admin(call.from_user.id):
         return await call.answer("🔐", show_alert=True)
     await call.message.edit_text(
