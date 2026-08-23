@@ -1149,7 +1149,7 @@ async def cmd_admin_cmd(msg: types.Message, state: FSMContext):
     await state.clear()
     if not is_admin(msg.from_user.id):
         return
-    await show_admin(msg)
+    await show_admin(msg, from_command=True)
 
 
 @dp.message(Command("pay"))
@@ -1263,12 +1263,14 @@ async def edit_or_reply(call: types.CallbackQuery, text: str, kb: InlineKeyboard
                 parse_mode=parse_mode
             )
     except Exception as e:
-        # Если не удалось отредактировать (сообщение старое или удалено)
+        log.warning(f"Не удалось отредактировать сообщение: {e}")
         try:
             await call.message.answer(text, reply_markup=kb, parse_mode=parse_mode)
         except Exception:
-            # Если и это не вышло, просто шлём новое в чат
-            await bot.send_message(call.from_user.id, text, reply_markup=kb, parse_mode=parse_mode)
+            try:
+                await bot.send_message(call.from_user.id, text, reply_markup=kb, parse_mode=parse_mode)
+            except Exception:
+                pass
 
 
 @dp.callback_query(F.data == "back_main")
@@ -1503,6 +1505,7 @@ async def cb_stop(call: types.CallbackQuery):
         return await call.answer("❌ Нет доступа", show_alert=True)
     await stop_bot(bid)
     await call.answer("⏹ Остановлен")
+    # Обновляем текущее сообщение с ботом
     await cb_bot(call)
 
 
@@ -1599,7 +1602,7 @@ async def cb_del(call: types.CallbackQuery):
         pass
     del_bot(bid)
     await call.answer("🗑 Удалён")
-    # Обновляем список ботов
+    # Обновляем список ботов в новом сообщении
     await cb_mybots(call)
 
 
@@ -1652,7 +1655,7 @@ async def cb_help(call: types.CallbackQuery, state: FSMContext):
 
 # ─── ADMIN ────────────────────────────────────────────────────
 
-async def show_admin(target, edit: bool = False):
+async def show_admin(target, edit: bool = False, from_command: bool = False):
     s  = get_stats()
     text = (
         f"🔐 <b>Админка</b>\n\n"
@@ -1677,9 +1680,15 @@ async def show_admin(target, edit: bool = False):
         [InlineKeyboardButton(text="🔄 Рестарт ботов",  callback_data="adm:restart")],
         [InlineKeyboardButton(text="« Меню",             callback_data="back_main")],
     ])
-    if edit:
+    
+    if from_command:
+        # Если вызвано из команды /admin - отправляем новое сообщение
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    elif edit and hasattr(target, 'message'):
+        # Если это callback с редактированием
         await edit_or_reply(target, text, kb)
     else:
+        # Просто отправляем
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
